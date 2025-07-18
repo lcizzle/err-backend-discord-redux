@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Changed
   - Bumped discord.py to version 2.4.0
+  - Migrated from depreciated logs_from to history
+  - Added some network error handling
 
 ## [4.0.1] Unreleased
 

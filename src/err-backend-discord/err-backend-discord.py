@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import sys
+import time
+from typing import Optional
 
 from errbot.backends.base import AWAY, DND, OFFLINE, ONLINE, Message, Person, Presence
 from errbot.core import ErrBot
@@ -40,6 +42,11 @@ class DiscordBackend(ErrBot):
         self.token = config.BOT_IDENTITY.get("token", None)
         self.initial_intents = config.BOT_IDENTITY.get("initial_intents", "default")
         self.intents = config.BOT_IDENTITY.get("intents", None)
+        
+        # Network retry configuration
+        self.max_retries = config.BOT_IDENTITY.get("max_retries", 3)
+        self.retry_delay = config.BOT_IDENTITY.get("retry_delay", 2.0)
+        self.timeout = config.BOT_IDENTITY.get("timeout", 30.0)
 
         if not self.token:
             log.fatal(
@@ -49,6 +56,58 @@ class DiscordBackend(ErrBot):
             sys.exit(1)
 
         self.bot_identifier = None
+
+    async def _retry_operation(self, operation, operation_name: str, *args, **kwargs):
+        """
+        Retry network operations with exponential backoff for transient errors.
+        """
+        last_exception = None
+        
+        for attempt in range(self.max_retries + 1):
+            try:
+                if asyncio.iscoroutinefunction(operation):
+                    return await operation(*args, **kwargs)
+                else:
+                    return operation(*args, **kwargs)
+                    
+            except (discord.HTTPException, discord.ConnectionClosed, discord.GatewayNotFound) as e:
+                last_exception = e
+                if attempt < self.max_retries:
+                    delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
+                    log.warning(f"{operation_name} failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    log.error(f"{operation_name} failed after {self.max_retries + 1} attempts: {e}")
+                    
+            except discord.Forbidden as e:
+                log.error(f"{operation_name} failed due to insufficient permissions: {e}")
+                raise
+                
+            except discord.NotFound as e:
+                log.error(f"{operation_name} failed - resource not found: {e}")
+                raise
+                
+            except Exception as e:
+                log.error(f"{operation_name} failed with unexpected error: {e}")
+                raise
+                
+        raise last_exception
+
+    def _safe_run_coroutine(self, coro, operation_name: str, timeout: Optional[float] = None):
+        """
+        Safely run a coroutine with timeout and error handling.
+        """
+        timeout = timeout or self.timeout
+        
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, loop=DiscordBackend.client.loop)
+            return future.result(timeout=timeout)
+        except asyncio.TimeoutError:
+            log.error(f"{operation_name} timed out after {timeout}s")
+            raise
+        except Exception as e:
+            log.error(f"{operation_name} failed: {e}")
+            raise
 
     def set_message_size_limit(self, limit=2000, hard_limit=2000):
         """
@@ -191,9 +250,14 @@ class DiscordBackend(ErrBot):
             msg.body[i : i + self.message_size_limit]
             for i in range(0, len(msg.body), self.message_size_limit)
         ]:
-            asyncio.run_coroutine_threadsafe(
-                msg.to.send(content=message), loop=DiscordBackend.client.loop
-            )
+            try:
+                self._safe_run_coroutine(
+                    self._retry_operation(msg.to.send, "send_message", content=message),
+                    "send_message"
+                )
+            except Exception as e:
+                log.error(f"Failed to send message to {msg.to}: {e}")
+                # Don't re-raise to prevent bot from crashing on message send failures
 
     def send_card(self, card):
         recipient = card.to
@@ -222,9 +286,15 @@ class DiscordBackend(ErrBot):
             for key, value in card.fields:
                 em.add_field(name=key, value=value, inline=True)
 
-        asyncio.run_coroutine_threadsafe(
-            recipient.send(embed=em), loop=DiscordBackend.client.loop
-        ).result(5)
+        try:
+            self._safe_run_coroutine(
+                self._retry_operation(recipient.send, "send_card", embed=em),
+                "send_card",
+                timeout=5.0
+            )
+        except Exception as e:
+            log.error(f"Failed to send card to {recipient}: {e}")
+            # Don't re-raise to prevent bot from crashing on card send failures
 
     def build_reply(self, mess, text=None, private=False, threaded=False):
         response = self.build_message(text)
@@ -346,13 +416,40 @@ class DiscordBackend(ErrBot):
             asyncio.run(start_client(self.token))
 
         except KeyboardInterrupt:
+            log.info("Received keyboard interrupt, shutting down...")
             self.disconnect_callback()
             return True
+        except discord.LoginFailure:
+            log.fatal("Invalid Discord token provided")
+            sys.exit(1)
+        except discord.HTTPException as e:
+            log.error(f"HTTP error during connection: {e}")
+            raise
+        except discord.ConnectionClosed as e:
+            log.error(f"Connection to Discord was closed: {e}")
+            raise
+        except Exception as e:
+            log.error(f"Unexpected error during connection: {e}")
+            raise
 
     def change_presence(self, status: str = ONLINE, message: str = ""):
         log.debug(f'Presence changed to {status} and activity "{message}".')
-        activity = discord.Activity(name=message)
-        DiscordBackend.client.change_presence(status=status, activity=activity)
+        try:
+            activity = discord.Activity(name=message)
+            
+            async def update_presence():
+                return await self._retry_operation(
+                    DiscordBackend.client.change_presence,
+                    "change_presence",
+                    status=status,
+                    activity=activity
+                )
+            
+            self._safe_run_coroutine(update_presence(), "change_presence")
+            
+        except Exception as e:
+            log.error(f"Failed to change presence: {e}")
+            # Don't re-raise to prevent bot from crashing on presence change failures
 
     def prefix_groupchat_reply(self, message, identifier: Person):
         message.body = f"@{identifier.nick} {message.body}"
@@ -417,24 +514,54 @@ class DiscordBackend(ErrBot):
         raise ValueError(f"Invalid representation {text}")
 
     def upload_file(self, msg, filename):
-        with open(filename, "r") as f:
-            dest = None
-            if msg.is_direct:
-                dest = DiscordPerson(msg.frm.id).get_discord_object()
-            else:
-                dest = msg.to.get_discord_object()
+        try:
+            with open(filename, "rb") as f:  # Open in binary mode for file uploads
+                dest = None
+                if msg.is_direct:
+                    dest = DiscordPerson(msg.frm.id).get_discord_object()
+                else:
+                    dest = msg.to.get_discord_object()
 
-            log.info(f"Sending file {filename} to user {msg.frm}")
-            asyncio.run_coroutine_threadsafe(
-                dest.send(file=discord.File(f, filename=filename)),
-                loop=self.client.loop,
-            )
+                log.info(f"Sending file {filename} to user {msg.frm}")
+                
+                async def send_file():
+                    return await self._retry_operation(
+                        dest.send, 
+                        "upload_file", 
+                        file=discord.File(f, filename=filename)
+                    )
+                
+                self._safe_run_coroutine(send_file(), "upload_file")
+                
+        except FileNotFoundError:
+            log.error(f"File not found: {filename}")
+            raise
+        except PermissionError:
+            log.error(f"Permission denied accessing file: {filename}")
+            raise
+        except Exception as e:
+            log.error(f"Failed to upload file {filename}: {e}")
+            raise
 
     def history(self, channelname, before=None):
-        mychannel = discord.utils.get(self.client.get_all_channels(), name=channelname)
+        try:
+            mychannel = discord.utils.get(self.client.get_all_channels(), name=channelname)
+            
+            if mychannel is None:
+                log.error(f"Channel '{channelname}' not found")
+                return []
 
-        async def gethist(mychannel, before=None):
-            return [i async for i in mychannel.history(limit=10, before=before)]
+            async def gethist(mychannel, before=None):
+                async def get_history():
+                    return [i async for i in mychannel.history(limit=10, before=before)]
+                
+                return await self._retry_operation(
+                    get_history,
+                    "history"
+                )
 
-        future = asyncio.run_coroutine_threadsafe(gethist(mychannel, before), loop=self.client.loop)
-        return future.result(timeout=None)
+            return self._safe_run_coroutine(gethist(mychannel, before), "history")
+            
+        except Exception as e:
+            log.error(f"Failed to get history for channel '{channelname}': {e}")
+            return []
