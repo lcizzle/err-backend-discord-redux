@@ -21,14 +21,7 @@ except ImportError:
     log.fatal("The required discord module could not be found.")
     sys.exit(1)
 
-COLOURS = {
-    "red": 0xFF0000,
-    "green": 0x008000,
-    "yellow": 0xFFA500,
-    "blue": 0x0000FF,
-    "white": 0xFFFFFF,
-    "cyan": 0x00FFFF,
-}
+
 
 
 class DiscordBackend(ErrBot):
@@ -48,7 +41,7 @@ class DiscordBackend(ErrBot):
         # Network retry configuration
         self.max_retries = config.BOT_IDENTITY.get("max_retries", 3)
         self.retry_delay = config.BOT_IDENTITY.get("retry_delay", 2.0)
-        self.timeout = config.BOT_IDENTITY.get("timeout", 30.0)
+        self.timeout = config.BOT_IDENTITY.get("timeout", 10.0)  # Reduced from 30s to 10s
         
         # Rate limiting configuration
         self.rate_limit_enabled = config.BOT_IDENTITY.get("rate_limit_enabled", True)
@@ -134,12 +127,31 @@ class DiscordBackend(ErrBot):
     def _safe_run_coroutine(self, coro, operation_name: str, timeout: Optional[float] = None):
         """
         Safely run a coroutine with timeout and error handling.
+        Uses a non-blocking approach to prevent Discord heartbeat issues.
         """
         timeout = timeout or self.timeout
         
         try:
+            # Use asyncio.run_coroutine_threadsafe but don't block waiting for result
             future = asyncio.run_coroutine_threadsafe(coro, loop=DiscordBackend.client.loop)
-            return future.result(timeout=timeout)
+            
+            # For non-critical operations, don't wait for completion to avoid blocking
+            if operation_name in ['send_message', 'send_card', 'add_reaction', 'remove_reaction']:
+                # Schedule the operation but don't wait for it
+                def handle_result(fut):
+                    try:
+                        result = fut.result()
+                        log.debug(f"{operation_name} completed successfully")
+                        return result
+                    except Exception as e:
+                        log.error(f"{operation_name} failed: {e}")
+                
+                future.add_done_callback(handle_result)
+                return None  # Don't block
+            else:
+                # For critical operations, wait with reduced timeout
+                return future.result(timeout=min(timeout, 5.0))
+                
         except asyncio.TimeoutError:
             log.error(f"{operation_name} timed out after {timeout}s")
             raise
@@ -344,7 +356,47 @@ class DiscordBackend(ErrBot):
         """
         Edit message event handler
         """
-        log.warning("Message editing not supported.")
+        # Ignore bot messages and messages without content changes
+        if after.author.bot or before.content == after.content:
+            return
+            
+        try:
+            # Prepare extras with edit information
+            edit_extras = {
+                'edited': True,
+                'original_content': before.content,
+                'edit_timestamp': after.edited_at.isoformat() if after.edited_at else None,
+                'discord_message_id': str(after.id)
+            }
+            
+            # Combine Discord embeds with edit information
+            combined_extras = list(after.embeds) if after.embeds else []
+            combined_extras.append(edit_extras)
+            
+            # Create the edited message object with proper extras
+            err_msg = Message(after.content, extras=combined_extras)
+            
+            # Set message identifiers
+            if isinstance(after.channel, discord.abc.PrivateChannel):
+                err_msg.frm = DiscordPerson(after.author.id)
+                err_msg.to = self.bot_identifier
+            else:
+                err_msg.to = DiscordRoom.from_id(after.channel.id)
+                err_msg.frm = DiscordRoomOccupant(after.author.id, after.channel.id)
+            
+            log.debug(f"Message edited by {err_msg.frm}: '{before.content}' -> '{after.content}'")
+            
+            # Process the edited message if it contains a command
+            if self.process_message(err_msg):
+                recipient = err_msg.frm
+                if isinstance(recipient, DiscordSender):
+                    async with recipient.get_discord_object().typing():
+                        self._dispatch_to_plugins("callback_message", err_msg)
+            
+            # Note: Plugins can detect edited messages by checking msg.extras for 'edited': True
+            
+        except Exception as e:
+            log.error(f"Error processing message edit event: {e}")
 
     async def on_message(self, msg: discord.Message):
         """
@@ -488,31 +540,130 @@ class DiscordBackend(ErrBot):
         except Exception as e:
             log.error(f"Error processing reaction remove event: {e}")
 
+    async def on_guild_channel_create(self, channel):
+        """
+        Channel creation event handler
+        """
+        try:
+            if isinstance(channel, discord.TextChannel):
+                room = DiscordRoom.from_id(channel.id)
+                log.info(f"Text channel created: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
+                self.callback_room_joined(room)
+            elif isinstance(channel, discord.CategoryChannel):
+                category = DiscordCategory(channel.name, channel.guild.id, channel.id)
+                log.info(f"Category created: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
+            else:
+                log.debug(f"Channel created: {channel.name} (Type: {type(channel).__name__})")
+                
+        except Exception as e:
+            log.error(f"Error processing channel create event: {e}")
+
+    async def on_guild_channel_delete(self, channel):
+        """
+        Channel deletion event handler
+        """
+        try:
+            if isinstance(channel, discord.TextChannel):
+                room = DiscordRoom.from_id(channel.id)
+                log.info(f"Text channel deleted: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
+                self.callback_room_left(room)
+            elif isinstance(channel, discord.CategoryChannel):
+                log.info(f"Category deleted: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
+            else:
+                log.debug(f"Channel deleted: {channel.name} (Type: {type(channel).__name__})")
+                
+        except Exception as e:
+            log.error(f"Error processing channel delete event: {e}")
+
+    async def on_guild_channel_update(self, before, after):
+        """
+        Channel update event handler
+        """
+        try:
+            # Check for topic changes
+            if hasattr(before, 'topic') and hasattr(after, 'topic') and before.topic != after.topic:
+                if isinstance(after, discord.TextChannel):
+                    room = DiscordRoom.from_id(after.id)
+                    log.info(f"Channel topic changed in {after.name}: '{before.topic}' -> '{after.topic}'")
+                    self.callback_room_topic(room)
+            
+            # Check for name changes
+            if before.name != after.name:
+                log.info(f"Channel renamed: '{before.name}' -> '{after.name}' (ID: {after.id})")
+            
+            # Check for permission changes
+            if before.overwrites != after.overwrites:
+                log.debug(f"Channel permissions updated for {after.name} (ID: {after.id})")
+                
+        except Exception as e:
+            log.error(f"Error processing channel update event: {e}")
+
     def query_room(self, room):
         """
-        Query room.
+        Query room with multi-guild support.
 
-        This method implicitly assume the bot is in one guild server.
+        Formats:
+        <#channel_id> -> Discord channel mention
+        ##category -> a category in first guild
+        ##category@guild_id -> a category in specific guild
+        #room -> a room in first guild  
+        #room@guild_id -> a room in specific guild
+        room -> a room in first guild
 
-        ##category -> a category
-        #room -> Creates a room
-
-        :param room:
-        :return:
+        :param room: Room identifier string
+        :return: DiscordRoom, DiscordCategory, or None
         """
         if len(DiscordBackend.client.guilds) == 0:
-            log.error(f"Unable to join room '{room}' because no guilds were found!")
+            log.error(f"Unable to query room '{room}' because no guilds were found!")
             return None
 
-        guild = DiscordBackend.client.guilds[0]
+        # Handle Discord channel mentions like <#1395580495932293163>
+        if room.startswith("<#") and room.endswith(">"):
+            try:
+                channel_id = int(room[2:-1])  # Extract ID from <#ID>
+                channel = DiscordBackend.client.get_channel(channel_id)
+                if channel:
+                    if isinstance(channel, discord.CategoryChannel):
+                        return DiscordCategory(channel.name, channel.guild.id, channel.id)
+                    else:
+                        return DiscordRoom.from_id(channel_id)
+                else:
+                    log.error(f"Channel with ID {channel_id} not found")
+                    return None
+            except ValueError:
+                log.error(f"Invalid channel ID in mention: {room}")
+                return None
 
+        # Parse guild specification
+        guild_id = None
         room_name = room
+        
+        if "@" in room:
+            room_name, guild_id = room.rsplit("@", 1)
+            try:
+                guild_id = int(guild_id)
+            except ValueError:
+                log.error(f"Invalid guild ID in room specification: {room}")
+                return None
+        
+        # Get the target guild
+        if guild_id:
+            guild = DiscordBackend.client.get_guild(guild_id)
+            if not guild:
+                log.error(f"Guild {guild_id} not found or bot not in guild")
+                return None
+        else:
+            guild = DiscordBackend.client.guilds[0]  # Default to first guild
+
+        # Parse room type and create appropriate object
         if room_name.startswith("##"):
             return DiscordCategory(room_name[2:], guild.id)
         elif room_name.startswith("#"):
             return DiscordRoom(room_name[1:], guild.id)
         else:
             return DiscordRoom(room_name, guild.id)
+
+
 
     def send_message(self, msg: Message):
         super().send_message(msg)
@@ -538,15 +689,37 @@ class DiscordBackend(ErrBot):
             for i in range(0, len(msg.body), self.message_size_limit)
         ]:
             try:
-                self._safe_run_coroutine(
-                    self._retry_operation(msg.to.send, "send_message", content=message),
-                    "send_message"
-                )
+                # Check if message should be sent to a thread
+                if hasattr(msg, 'extras') and msg.extras and msg.extras.get('thread_id'):
+                    thread_id = msg.extras['thread_id']
+                    thread = DiscordBackend.client.get_channel(int(thread_id))
+                    if thread and isinstance(thread, discord.Thread):
+                        self._safe_run_coroutine(
+                            self._retry_operation(thread.send, "send_message_to_thread", content=message),
+                            "send_message_to_thread"
+                        )
+                        log.debug(f"Sent message to thread {thread_id}")
+                    else:
+                        log.warning(f"Thread {thread_id} not found, sending to regular channel")
+                        self._safe_run_coroutine(
+                            self._retry_operation(msg.to.send, "send_message", content=message),
+                            "send_message"
+                        )
+                else:
+                    # Regular message sending
+                    self._safe_run_coroutine(
+                        self._retry_operation(msg.to.send, "send_message", content=message),
+                        "send_message"
+                    )
             except Exception as e:
                 log.error(f"Failed to send message to {msg.to}: {e}")
                 # Don't re-raise to prevent bot from crashing on message send failures
 
     def send_card(self, card):
+        """
+        Send a basic Discord embed card.
+        For advanced card features, use the DiscordCards plugin.
+        """
         recipient = card.to
 
         if not isinstance(recipient, DiscordSender):
@@ -564,23 +737,11 @@ class DiscordBackend(ErrBot):
             log.debug(f"Card to {recipient} dropped due to rate limiting")
             return
 
-        if card.color:
-            color = COLOURS.get(card.color, int(card.color.replace("#", "0x"), 16))
-        else:
-            color = None
-
-        # Create Embed object
-        em = discord.Embed(title=card.title, description=card.body, color=color)
-
-        if card.image:
-            em.set_image(url=card.image)
-
-        if card.thumbnail:
-            em.set_thumbnail(url=card.thumbnail)
-
-        if card.fields:
-            for key, value in card.fields:
-                em.add_field(name=key, value=value, inline=True)
+        # Basic embed creation (core functionality)
+        em = discord.Embed(
+            title=card.title or None,
+            description=card.body or None
+        )
 
         try:
             self._safe_run_coroutine(
@@ -591,6 +752,92 @@ class DiscordBackend(ErrBot):
         except Exception as e:
             log.error(f"Failed to send card to {recipient}: {e}")
             # Don't re-raise to prevent bot from crashing on card send failures
+
+    def send_discord_embed(self, recipient, title=None, description=None, color=None, 
+                          fields=None, image=None, thumbnail=None, footer=None, 
+                          author=None, url=None, timestamp=None):
+        """
+        Send a Discord embed with full Discord-specific features.
+        This is the backend API for plugins to create rich embeds.
+        """
+        if not isinstance(recipient, DiscordSender):
+            raise RuntimeError(f"Recipient must be a DiscordSender, got {type(recipient)}")
+
+        # Create a mock message for rate limiting check
+        mock_msg = Message("")
+        mock_msg.to = recipient
+        
+        # Check rate limiting before sending
+        if not self._should_send_message(mock_msg):
+            log.debug(f"Discord embed to {recipient} dropped due to rate limiting")
+            return False
+
+        try:
+            # Create Discord embed
+            em = discord.Embed(
+                title=title,
+                description=description,
+                color=color,
+                url=url,
+                timestamp=timestamp
+            )
+
+            # Add fields
+            if fields:
+                for field in fields:
+                    if isinstance(field, dict):
+                        em.add_field(
+                            name=field.get('name', 'Field'),
+                            value=field.get('value', 'Value'),
+                            inline=field.get('inline', True)
+                        )
+                    elif isinstance(field, (list, tuple)) and len(field) >= 2:
+                        em.add_field(
+                            name=field[0],
+                            value=field[1],
+                            inline=field[2] if len(field) > 2 else True
+                        )
+
+            # Add image
+            if image:
+                em.set_image(url=image)
+
+            # Add thumbnail
+            if thumbnail:
+                em.set_thumbnail(url=thumbnail)
+
+            # Add footer
+            if footer:
+                if isinstance(footer, dict):
+                    em.set_footer(
+                        text=footer.get('text', ''),
+                        icon_url=footer.get('icon_url')
+                    )
+                else:
+                    em.set_footer(text=str(footer))
+
+            # Add author
+            if author:
+                if isinstance(author, dict):
+                    em.set_author(
+                        name=author.get('name', ''),
+                        url=author.get('url'),
+                        icon_url=author.get('icon_url')
+                    )
+                else:
+                    em.set_author(name=str(author))
+
+            # Send the embed
+            self._safe_run_coroutine(
+                self._retry_operation(recipient.send, "send_discord_embed", embed=em),
+                "send_discord_embed",
+                timeout=5.0
+            )
+            return True
+
+        except Exception as e:
+            log.error(f"Failed to send Discord embed to {recipient}: {e}")
+            return False
 
     def build_reply(self, mess, text=None, private=False, threaded=False):
         response = self.build_message(text)
@@ -604,7 +851,33 @@ class DiscordBackend(ErrBot):
 
             response.frm = DiscordRoomOccupant(self.bot_identifier.id, mess.frm.room.id)
             response.to = DiscordPerson(mess.frm.id) if private else mess.to
+            
+            # Handle thread support
+            if threaded and hasattr(mess, 'extras') and mess.extras:
+                # Check if the original message has thread information
+                thread_id = mess.extras.get('thread_id')
+                discord_msg_id = mess.extras.get('discord_message_id')
+                
+                if thread_id:
+                    # Reply in existing thread
+                    response.extras = response.extras or {}
+                    response.extras['thread_id'] = thread_id
+                    log.debug(f"Replying in existing thread {thread_id}")
+                elif discord_msg_id and not mess.is_direct:
+                    # Create a new thread from the original message
+                    try:
+                        thread_name = f"Reply to {mess.frm.nick}" if hasattr(mess.frm, 'nick') else "Thread"
+                        thread_id = self._create_thread_from_message(discord_msg_id, thread_name)
+                        if thread_id:
+                            response.extras = response.extras or {}
+                            response.extras['thread_id'] = thread_id
+                            log.debug(f"Created new thread {thread_id} for threaded reply")
+                    except Exception as e:
+                        log.warning(f"Failed to create thread for reply: {e}")
+                        
         return response
+
+
 
     def config_intents(self):
         """
@@ -684,6 +957,9 @@ class DiscordBackend(ErrBot):
             self.on_member_update,
             self.on_reaction_add,
             self.on_reaction_remove,
+            self.on_guild_channel_create,
+            self.on_guild_channel_delete,
+            self.on_guild_channel_update,
         ]:
             DiscordBackend.client.event(func)
 
@@ -731,9 +1007,13 @@ class DiscordBackend(ErrBot):
             raise
 
     def change_presence(self, status: str = ONLINE, message: str = ""):
+        """
+        Change bot presence with basic activity.
+        For advanced presence features, use set_discord_presence().
+        """
         log.debug(f'Presence changed to {status} and activity "{message}".')
         try:
-            activity = discord.Activity(name=message)
+            activity = discord.Activity(name=message) if message else None
             
             async def update_presence():
                 return await self._retry_operation(
@@ -748,6 +1028,8 @@ class DiscordBackend(ErrBot):
         except Exception as e:
             log.error(f"Failed to change presence: {e}")
             # Don't re-raise to prevent bot from crashing on presence change failures
+
+
 
     def add_reaction(self, msg: Message, reaction: str) -> None:
         """
@@ -934,7 +1216,14 @@ class DiscordBackend(ErrBot):
         elif text.startswith("@"):
             text = text[1:]
             if "#" in text:
-                user, discriminator = text.split("#",1)
+                user, discriminator = text.split("#", 1)
+                return DiscordPerson(username=user, discriminator=discriminator)
+        # Handle Discord username format without @ prefix (e.g., "lcizzle#0")
+        elif "#" in text and not text.startswith("#"):
+            # This looks like a Discord username#discriminator format
+            user, discriminator = text.split("#", 1)
+            # Validate that discriminator is numeric (Discord discriminators are 4 digits or "0")
+            if discriminator.isdigit() or discriminator == "0":
                 return DiscordPerson(username=user, discriminator=discriminator)
 
         raise ValueError(f"Invalid representation {text}")

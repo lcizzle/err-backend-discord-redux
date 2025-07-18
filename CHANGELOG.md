@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   - Added some network error handling
   - Added basic rate handling
   - Added basic reaction support
+  - Added basic thread support
+  - Added basic message editing support
+  - Added more room functionality
+  - Fixed blocking issue that caused some disconnects
+  - Added discord presence support.
+  - Reworked some of the added features like reactions, message threads, message editing, presence support, send_card, to have only the minimal functionality in the backend and then a broken out more through implementation as a plugin. Not 100% sure what to do with this yet. Trying to keep the backend light. Maybe start another repo or just leave this part of the implementation up to the plugin developer / end user.
 
 ## [4.0.1] Unreleased
 

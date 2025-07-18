@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import sys
 from typing import List, Optional, Union
@@ -51,9 +52,9 @@ class DiscordRoom(Room, DiscordSender):
             if guild:
                 channel = [channel for channel in guild.channels if channel_name == channel.name]
                 if len(channel) == 0:
-                    ValueError(f"Failed to find channel {channel_name} in guild {guild.name}")
+                    raise ValueError(f"Failed to find channel {channel_name} in guild {guild.name}")
                 if len(channel) > 1:
-                    ValueError(
+                    raise ValueError(
                         f"More than one channel matched {channel_name} in guild {guild.name}"
                     )
                 self.discord_channel = channel[0]
@@ -171,6 +172,32 @@ class DiscordRoom(Room, DiscordSender):
         topic = "" if topic is None else topic
 
         return topic
+
+    @topic.setter
+    def topic(self, new_topic: str) -> None:
+        """
+        Set the channel topic.
+        
+        Args:
+            new_topic: The new topic to set
+        """
+        if not self.exists:
+            raise RoomError("Cannot set topic for non-existent channel")
+        
+        try:
+            async def set_topic_async():
+                await self.discord_channel.edit(topic=new_topic)
+            
+            asyncio.run_coroutine_threadsafe(
+                set_topic_async(), 
+                loop=DiscordRoom.client.loop
+            ).result(timeout=10)
+            
+            log.info(f"Set topic for channel {self.name}: '{new_topic}'")
+            
+        except Exception as e:
+            log.error(f"Failed to set topic for channel {self.name}: {e}")
+            raise RoomError(f"Failed to set topic: {e}")
 
     @property
     def occupants(self) -> List[RoomOccupant]:
