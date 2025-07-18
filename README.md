@@ -1,4 +1,4 @@
-# Discord backend for Errbot
+# Discord backend for Errbot (Redux)
 
 This is the Discord backend for errbot.
 
