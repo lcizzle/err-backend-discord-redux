@@ -434,7 +434,7 @@ class DiscordBackend(ErrBot):
         mychannel = discord.utils.get(self.client.get_all_channels(), name=channelname)
 
         async def gethist(mychannel, before=None):
-            return [i async for i in self.client.logs_from(mychannel, limit=10, before=before)]
+            return [i async for i in mychannel.history(limit=10, before=before)]
 
         future = asyncio.run_coroutine_threadsafe(gethist(mychannel, before), loop=self.client.loop)
         return future.result(timeout=None)
