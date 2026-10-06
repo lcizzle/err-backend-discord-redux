@@ -276,6 +276,9 @@ class DiscordRoomOccupant(DiscordPerson, RoomOccupant):
     def room(self) -> DiscordRoom:
         return self._channel
 
+    def get_discord_object(self) -> discord.abc.Messageable:
+        return self._channel.discord_channel
+
     async def send(self, content: str = None, embed: discord.Embed = None):
         await self.room.send(content=content, embed=embed)
 

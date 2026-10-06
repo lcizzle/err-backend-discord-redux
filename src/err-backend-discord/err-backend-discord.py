@@ -390,7 +390,11 @@ class DiscordBackend(ErrBot):
             if self.process_message(err_msg):
                 recipient = err_msg.frm
                 if isinstance(recipient, DiscordSender):
-                    async with recipient.get_discord_object().typing():
+                    try:
+                        async with recipient.get_discord_object().typing():
+                            self._dispatch_to_plugins("callback_message", err_msg)
+                    except discord.HTTPException as e:
+                        log.warning(f"Failed to trigger typing indicator: {e}")
                         self._dispatch_to_plugins("callback_message", err_msg)
             
             # Note: Plugins can detect edited messages by checking msg.extras for 'edited': True
@@ -425,7 +429,11 @@ class DiscordBackend(ErrBot):
             if not isinstance(recipient, DiscordSender):
                 raise ValueError("Message object from is not a DiscordSender")
 
-            async with recipient.get_discord_object().typing():
+            try:
+                async with recipient.get_discord_object().typing():
+                    self._dispatch_to_plugins("callback_message", err_msg)
+            except discord.HTTPException as e:
+                log.warning(f"Failed to trigger typing indicator: {e}")
                 self._dispatch_to_plugins("callback_message", err_msg)
 
         if msg.mentions:
