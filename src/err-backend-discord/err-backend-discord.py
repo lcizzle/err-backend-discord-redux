@@ -3,14 +3,24 @@ import logging
 import sys
 import time
 from collections import defaultdict, deque
-from typing import Optional, Dict, Deque
 from threading import Lock
-
-from errbot.backends.base import AWAY, DND, OFFLINE, ONLINE, Message, Person, Presence, Reaction, REACTION_ADDED, REACTION_REMOVED
-from errbot.core import ErrBot
+from typing import Deque, Dict, Optional
 
 from discordlib.person import DiscordPerson, DiscordSender
 from discordlib.room import DiscordCategory, DiscordRoom, DiscordRoomOccupant
+from errbot.backends.base import (
+    AWAY,
+    DND,
+    OFFLINE,
+    ONLINE,
+    REACTION_ADDED,
+    REACTION_REMOVED,
+    Message,
+    Person,
+    Presence,
+    Reaction,
+)
+from errbot.core import ErrBot
 
 log = logging.getLogger("errbot-backend-discord")
 
@@ -20,8 +30,6 @@ except ImportError:
     log.exception("Could not start err-backend-discord")
     log.fatal("The required discord module could not be found.")
     sys.exit(1)
-
-
 
 
 class DiscordBackend(ErrBot):
@@ -37,25 +45,33 @@ class DiscordBackend(ErrBot):
         self.token = config.BOT_IDENTITY.get("token", None)
         self.initial_intents = config.BOT_IDENTITY.get("initial_intents", "default")
         self.intents = config.BOT_IDENTITY.get("intents", None)
-        
+
         # Network retry configuration
         self.max_retries = config.BOT_IDENTITY.get("max_retries", 3)
         self.retry_delay = config.BOT_IDENTITY.get("retry_delay", 2.0)
         self.timeout = config.BOT_IDENTITY.get("timeout", 10.0)  # Reduced from 30s to 10s
-        
+
         # Rate limiting configuration
         self.rate_limit_enabled = config.BOT_IDENTITY.get("rate_limit_enabled", True)
-        self.global_rate_limit = config.BOT_IDENTITY.get("global_rate_limit", 50)  # requests per minute
-        self.per_channel_rate_limit = config.BOT_IDENTITY.get("per_channel_rate_limit", 5)  # messages per minute per channel
-        self.per_user_rate_limit = config.BOT_IDENTITY.get("per_user_rate_limit", 10)  # messages per minute per user
+        self.global_rate_limit = config.BOT_IDENTITY.get(
+            "global_rate_limit", 50
+        )  # requests per minute
+        self.per_channel_rate_limit = config.BOT_IDENTITY.get(
+            "per_channel_rate_limit", 5
+        )  # messages per minute per channel
+        self.per_user_rate_limit = config.BOT_IDENTITY.get(
+            "per_user_rate_limit", 10
+        )  # messages per minute per user
         self.rate_limit_window = config.BOT_IDENTITY.get("rate_limit_window", 60)  # seconds
-        
+
         # Rate limiting tracking
         self._rate_limit_lock = Lock()
         self._global_requests: Deque[float] = deque()
         self._channel_requests: Dict[str, Deque[float]] = defaultdict(deque)
         self._user_requests: Dict[str, Deque[float]] = defaultdict(deque)
-        self._rate_limit_warnings: Dict[str, float] = {}  # Track when we last warned about rate limits
+        self._rate_limit_warnings: Dict[str, float] = (
+            {}
+        )  # Track when we last warned about rate limits
 
         if not self.token:
             log.fatal(
@@ -65,7 +81,7 @@ class DiscordBackend(ErrBot):
             sys.exit(1)
 
         self.bot_identifier = None
-        
+
         # Message tracking for reactions
         self._message_cache: Dict[str, discord.Message] = {}  # errbot message id -> discord message
         self._message_cache_lock = Lock()
@@ -76,52 +92,58 @@ class DiscordBackend(ErrBot):
         Retry network operations with exponential backoff for transient errors.
         """
         last_exception = None
-        
+
         for attempt in range(self.max_retries + 1):
             try:
                 if asyncio.iscoroutinefunction(operation):
                     return await operation(*args, **kwargs)
                 else:
                     return operation(*args, **kwargs)
-                    
+
             except discord.HTTPException as e:
                 last_exception = e
-                
+
                 # Handle Discord rate limiting specifically
                 if e.status == 429:  # Too Many Requests
-                    retry_after = getattr(e, 'retry_after', None) or self.retry_delay
-                    log.warning(f"{operation_name} rate limited by Discord. Waiting {retry_after}s before retry...")
+                    retry_after = getattr(e, "retry_after", None) or self.retry_delay
+                    log.warning(
+                        f"{operation_name} rate limited by Discord. Waiting {retry_after}s before retry..."
+                    )
                     await asyncio.sleep(retry_after)
                     continue  # Don't count rate limit as a retry attempt
-                
+
                 if attempt < self.max_retries:
-                    delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                    log.warning(f"{operation_name} failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}. Retrying in {delay}s...")
+                    delay = self.retry_delay * (2**attempt)  # Exponential backoff
+                    log.warning(
+                        f"{operation_name} failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}. Retrying in {delay}s..."
+                    )
                     await asyncio.sleep(delay)
                 else:
                     log.error(f"{operation_name} failed after {self.max_retries + 1} attempts: {e}")
-                    
+
             except (discord.ConnectionClosed, discord.GatewayNotFound) as e:
                 last_exception = e
                 if attempt < self.max_retries:
-                    delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
-                    log.warning(f"{operation_name} failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}. Retrying in {delay}s...")
+                    delay = self.retry_delay * (2**attempt)  # Exponential backoff
+                    log.warning(
+                        f"{operation_name} failed (attempt {attempt + 1}/{self.max_retries + 1}): {e}. Retrying in {delay}s..."
+                    )
                     await asyncio.sleep(delay)
                 else:
                     log.error(f"{operation_name} failed after {self.max_retries + 1} attempts: {e}")
-                    
+
             except discord.Forbidden as e:
                 log.error(f"{operation_name} failed due to insufficient permissions: {e}")
                 raise
-                
+
             except discord.NotFound as e:
                 log.error(f"{operation_name} failed - resource not found: {e}")
                 raise
-                
+
             except Exception as e:
                 log.error(f"{operation_name} failed with unexpected error: {e}")
                 raise
-                
+
         raise last_exception
 
     def _safe_run_coroutine(self, coro, operation_name: str, timeout: Optional[float] = None):
@@ -130,13 +152,13 @@ class DiscordBackend(ErrBot):
         Uses a non-blocking approach to prevent Discord heartbeat issues.
         """
         timeout = timeout or self.timeout
-        
+
         try:
             # Use asyncio.run_coroutine_threadsafe but don't block waiting for result
             future = asyncio.run_coroutine_threadsafe(coro, loop=DiscordBackend.client.loop)
-            
+
             # For non-critical operations, don't wait for completion to avoid blocking
-            if operation_name in ['send_message', 'send_card', 'add_reaction', 'remove_reaction']:
+            if operation_name in ["send_message", "send_card", "add_reaction", "remove_reaction"]:
                 # Schedule the operation but don't wait for it
                 def handle_result(fut):
                     try:
@@ -145,13 +167,13 @@ class DiscordBackend(ErrBot):
                         return result
                     except Exception as e:
                         log.error(f"{operation_name} failed: {e}")
-                
+
                 future.add_done_callback(handle_result)
                 return None  # Don't block
             else:
                 # For critical operations, wait with reduced timeout
                 return future.result(timeout=min(timeout, 5.0))
-                
+
         except asyncio.TimeoutError:
             log.error(f"{operation_name} timed out after {timeout}s")
             raise
@@ -165,77 +187,79 @@ class DiscordBackend(ErrBot):
         """
         current_time = time.time()
         cutoff_time = current_time - self.rate_limit_window
-        
+
         while request_queue and request_queue[0] < cutoff_time:
             request_queue.popleft()
 
-    def _is_rate_limited(self, identifier: str = None, channel_id: str = None, user_id: str = None) -> bool:
+    def _is_rate_limited(
+        self, identifier: str = None, channel_id: str = None, user_id: str = None
+    ) -> bool:
         """
         Check if we're currently rate limited for the given context.
-        
+
         Args:
             identifier: General identifier for rate limit warnings
             channel_id: Channel ID for per-channel rate limiting
             user_id: User ID for per-user rate limiting
-            
+
         Returns:
             True if rate limited, False otherwise
         """
         if not self.rate_limit_enabled:
             return False
-            
+
         current_time = time.time()
-        
+
         with self._rate_limit_lock:
             # Clean old requests
             self._clean_old_requests(self._global_requests)
-            
+
             # Check global rate limit
             if len(self._global_requests) >= self.global_rate_limit:
                 self._warn_rate_limit("global", identifier)
                 return True
-            
+
             # Check per-channel rate limit
             if channel_id:
                 channel_queue = self._channel_requests[channel_id]
                 self._clean_old_requests(channel_queue)
-                
+
                 if len(channel_queue) >= self.per_channel_rate_limit:
                     self._warn_rate_limit(f"channel:{channel_id}", identifier)
                     return True
-            
+
             # Check per-user rate limit
             if user_id:
                 user_queue = self._user_requests[user_id]
                 self._clean_old_requests(user_queue)
-                
+
                 if len(user_queue) >= self.per_user_rate_limit:
                     self._warn_rate_limit(f"user:{user_id}", identifier)
                     return True
-                    
+
         return False
 
     def _record_request(self, channel_id: str = None, user_id: str = None) -> None:
         """
         Record a request for rate limiting tracking.
-        
+
         Args:
             channel_id: Channel ID for per-channel tracking
             user_id: User ID for per-user tracking
         """
         if not self.rate_limit_enabled:
             return
-            
+
         current_time = time.time()
-        
+
         with self._rate_limit_lock:
             # Record global request
             self._global_requests.append(current_time)
-            
+
             # Record per-channel request
             if channel_id:
                 self._channel_requests[channel_id].append(current_time)
-            
+
             # Record per-user request
             if user_id:
                 self._user_requests[user_id].append(current_time)
@@ -243,49 +267,53 @@ class DiscordBackend(ErrBot):
     def _warn_rate_limit(self, limit_type: str, identifier: str = None) -> None:
         """
         Log rate limit warnings, but not too frequently.
-        
+
         Args:
             limit_type: Type of rate limit (global, channel:id, user:id)
             identifier: Additional identifier for context
         """
         current_time = time.time()
         warning_key = f"{limit_type}:{identifier}" if identifier else limit_type
-        
+
         # Only warn once per minute per limit type
-        if warning_key not in self._rate_limit_warnings or \
-           current_time - self._rate_limit_warnings[warning_key] > 60:
-            
-            log.warning(f"Rate limit reached for {limit_type}. Dropping message to prevent Discord API limits.")
+        if (
+            warning_key not in self._rate_limit_warnings
+            or current_time - self._rate_limit_warnings[warning_key] > 60
+        ):
+
+            log.warning(
+                f"Rate limit reached for {limit_type}. Dropping message to prevent Discord API limits."
+            )
             self._rate_limit_warnings[warning_key] = current_time
 
     def _should_send_message(self, msg: Message) -> bool:
         """
         Check if we should send a message based on rate limiting.
-        
+
         Args:
             msg: The message to potentially send
-            
+
         Returns:
             True if message should be sent, False if rate limited
         """
         if not self.rate_limit_enabled:
             return True
-            
+
         # Extract identifiers for rate limiting
         channel_id = None
         user_id = None
         identifier = str(msg.to)
-        
-        if hasattr(msg.to, 'id'):
+
+        if hasattr(msg.to, "id"):
             if isinstance(msg.to, DiscordRoom):
                 channel_id = str(msg.to.id)
             elif isinstance(msg.to, DiscordPerson):
                 user_id = str(msg.to.id)
-        
+
         # Check if rate limited
         if self._is_rate_limited(identifier=identifier, channel_id=channel_id, user_id=user_id):
             return False
-            
+
         # Record the request
         self._record_request(channel_id=channel_id, user_id=user_id)
         return True
@@ -293,36 +321,36 @@ class DiscordBackend(ErrBot):
     def get_rate_limit_status(self) -> Dict[str, int]:
         """
         Get current rate limit status for monitoring.
-        
+
         Returns:
             Dictionary with current request counts
         """
         if not self.rate_limit_enabled:
             return {"rate_limiting": "disabled"}
-            
+
         with self._rate_limit_lock:
             # Clean old requests first
             self._clean_old_requests(self._global_requests)
-            
+
             status = {
                 "global_requests": len(self._global_requests),
                 "global_limit": self.global_rate_limit,
                 "active_channels": len(self._channel_requests),
                 "active_users": len(self._user_requests),
-                "rate_limit_window": self.rate_limit_window
+                "rate_limit_window": self.rate_limit_window,
             }
-            
+
             # Add top channels by request count
             channel_counts = {}
             for channel_id, queue in self._channel_requests.items():
                 self._clean_old_requests(queue)
                 if queue:  # Only include channels with recent requests
                     channel_counts[channel_id] = len(queue)
-            
+
             if channel_counts:
                 top_channels = sorted(channel_counts.items(), key=lambda x: x[1], reverse=True)[:5]
                 status["top_channels"] = top_channels
-                
+
             return status
 
     def set_message_size_limit(self, limit=2000, hard_limit=2000):
@@ -359,23 +387,23 @@ class DiscordBackend(ErrBot):
         # Ignore bot messages and messages without content changes
         if after.author.bot or before.content == after.content:
             return
-            
+
         try:
             # Prepare extras with edit information
             edit_extras = {
-                'edited': True,
-                'original_content': before.content,
-                'edit_timestamp': after.edited_at.isoformat() if after.edited_at else None,
-                'discord_message_id': str(after.id)
+                "edited": True,
+                "original_content": before.content,
+                "edit_timestamp": after.edited_at.isoformat() if after.edited_at else None,
+                "discord_message_id": str(after.id),
             }
-            
+
             # Combine Discord embeds with edit information
             combined_extras = list(after.embeds) if after.embeds else []
             combined_extras.append(edit_extras)
-            
+
             # Create the edited message object with proper extras
             err_msg = Message(after.content, extras=combined_extras)
-            
+
             # Set message identifiers
             if isinstance(after.channel, discord.abc.PrivateChannel):
                 err_msg.frm = DiscordPerson(after.author.id)
@@ -383,9 +411,9 @@ class DiscordBackend(ErrBot):
             else:
                 err_msg.to = DiscordRoom.from_id(after.channel.id)
                 err_msg.frm = DiscordRoomOccupant(after.author.id, after.channel.id)
-            
+
             log.debug(f"Message edited by {err_msg.frm}: '{before.content}' -> '{after.content}'")
-            
+
             # Process the edited message if it contains a command
             if self.process_message(err_msg):
                 recipient = err_msg.frm
@@ -396,9 +424,9 @@ class DiscordBackend(ErrBot):
                     except discord.HTTPException as e:
                         log.warning(f"Failed to trigger typing indicator: {e}")
                         self._dispatch_to_plugins("callback_message", err_msg)
-            
+
             # Note: Plugins can detect edited messages by checking msg.extras for 'edited': True
-            
+
         except Exception as e:
             log.error(f"Error processing message edit event: {e}")
 
@@ -476,19 +504,19 @@ class DiscordBackend(ErrBot):
         """
         if user.bot:
             return  # Ignore bot reactions
-            
+
         try:
             # Create the reactor (person who added the reaction)
             if isinstance(reaction.message.channel, discord.abc.PrivateChannel):
                 reactor = DiscordPerson(user.id)
             else:
                 reactor = DiscordRoomOccupant(user.id, reaction.message.channel.id)
-            
+
             # Get reaction name (emoji or custom emoji name)
             reaction_name = str(reaction.emoji)
-            if hasattr(reaction.emoji, 'name'):
+            if hasattr(reaction.emoji, "name"):
                 reaction_name = reaction.emoji.name
-            
+
             # Create the reaction object
             err_reaction = Reaction(
                 reactor=reactor,
@@ -496,16 +524,18 @@ class DiscordBackend(ErrBot):
                 timestamp=str(int(time.time())),
                 reaction_name=reaction_name,
                 reacted_to={
-                    'message_id': str(reaction.message.id),
-                    'channel_id': str(reaction.message.channel.id),
-                    'author_id': str(reaction.message.author.id),
-                    'content': reaction.message.content[:100]  # First 100 chars for context
-                }
+                    "message_id": str(reaction.message.id),
+                    "channel_id": str(reaction.message.channel.id),
+                    "author_id": str(reaction.message.author.id),
+                    "content": reaction.message.content[:100],  # First 100 chars for context
+                },
             )
-            
-            log.debug(f"Reaction added: {reaction_name} by {reactor} to message {reaction.message.id}")
+
+            log.debug(
+                f"Reaction added: {reaction_name} by {reactor} to message {reaction.message.id}"
+            )
             self.callback_reaction(err_reaction)
-            
+
         except Exception as e:
             log.error(f"Error processing reaction add event: {e}")
 
@@ -515,19 +545,19 @@ class DiscordBackend(ErrBot):
         """
         if user.bot:
             return  # Ignore bot reactions
-            
+
         try:
             # Create the reactor (person who removed the reaction)
             if isinstance(reaction.message.channel, discord.abc.PrivateChannel):
                 reactor = DiscordPerson(user.id)
             else:
                 reactor = DiscordRoomOccupant(user.id, reaction.message.channel.id)
-            
+
             # Get reaction name (emoji or custom emoji name)
             reaction_name = str(reaction.emoji)
-            if hasattr(reaction.emoji, 'name'):
+            if hasattr(reaction.emoji, "name"):
                 reaction_name = reaction.emoji.name
-            
+
             # Create the reaction object
             err_reaction = Reaction(
                 reactor=reactor,
@@ -535,16 +565,18 @@ class DiscordBackend(ErrBot):
                 timestamp=str(int(time.time())),
                 reaction_name=reaction_name,
                 reacted_to={
-                    'message_id': str(reaction.message.id),
-                    'channel_id': str(reaction.message.channel.id),
-                    'author_id': str(reaction.message.author.id),
-                    'content': reaction.message.content[:100]  # First 100 chars for context
-                }
+                    "message_id": str(reaction.message.id),
+                    "channel_id": str(reaction.message.channel.id),
+                    "author_id": str(reaction.message.author.id),
+                    "content": reaction.message.content[:100],  # First 100 chars for context
+                },
             )
-            
-            log.debug(f"Reaction removed: {reaction_name} by {reactor} from message {reaction.message.id}")
+
+            log.debug(
+                f"Reaction removed: {reaction_name} by {reactor} from message {reaction.message.id}"
+            )
             self.callback_reaction(err_reaction)
-            
+
         except Exception as e:
             log.error(f"Error processing reaction remove event: {e}")
 
@@ -555,14 +587,18 @@ class DiscordBackend(ErrBot):
         try:
             if isinstance(channel, discord.TextChannel):
                 room = DiscordRoom.from_id(channel.id)
-                log.info(f"Text channel created: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
+                log.info(
+                    f"Text channel created: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}"
+                )
                 self.callback_room_joined(room)
             elif isinstance(channel, discord.CategoryChannel):
                 category = DiscordCategory(channel.name, channel.guild.id, channel.id)
-                log.info(f"Category created: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
+                log.info(
+                    f"Category created: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}"
+                )
             else:
                 log.debug(f"Channel created: {channel.name} (Type: {type(channel).__name__})")
-                
+
         except Exception as e:
             log.error(f"Error processing channel create event: {e}")
 
@@ -573,13 +609,17 @@ class DiscordBackend(ErrBot):
         try:
             if isinstance(channel, discord.TextChannel):
                 room = DiscordRoom.from_id(channel.id)
-                log.info(f"Text channel deleted: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
+                log.info(
+                    f"Text channel deleted: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}"
+                )
                 self.callback_room_left(room)
             elif isinstance(channel, discord.CategoryChannel):
-                log.info(f"Category deleted: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}")
+                log.info(
+                    f"Category deleted: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}"
+                )
             else:
                 log.debug(f"Channel deleted: {channel.name} (Type: {type(channel).__name__})")
-                
+
         except Exception as e:
             log.error(f"Error processing channel delete event: {e}")
 
@@ -589,20 +629,22 @@ class DiscordBackend(ErrBot):
         """
         try:
             # Check for topic changes
-            if hasattr(before, 'topic') and hasattr(after, 'topic') and before.topic != after.topic:
+            if hasattr(before, "topic") and hasattr(after, "topic") and before.topic != after.topic:
                 if isinstance(after, discord.TextChannel):
                     room = DiscordRoom.from_id(after.id)
-                    log.info(f"Channel topic changed in {after.name}: '{before.topic}' -> '{after.topic}'")
+                    log.info(
+                        f"Channel topic changed in {after.name}: '{before.topic}' -> '{after.topic}'"
+                    )
                     self.callback_room_topic(room)
-            
+
             # Check for name changes
             if before.name != after.name:
                 log.info(f"Channel renamed: '{before.name}' -> '{after.name}' (ID: {after.id})")
-            
+
             # Check for permission changes
             if before.overwrites != after.overwrites:
                 log.debug(f"Channel permissions updated for {after.name} (ID: {after.id})")
-                
+
         except Exception as e:
             log.error(f"Error processing channel update event: {e}")
 
@@ -614,7 +656,7 @@ class DiscordBackend(ErrBot):
         <#channel_id> -> Discord channel mention
         ##category -> a category in first guild
         ##category@guild_id -> a category in specific guild
-        #room -> a room in first guild  
+        #room -> a room in first guild
         #room@guild_id -> a room in specific guild
         room -> a room in first guild
 
@@ -645,7 +687,7 @@ class DiscordBackend(ErrBot):
         # Parse guild specification
         guild_id = None
         room_name = room
-        
+
         if "@" in room:
             room_name, guild_id = room.rsplit("@", 1)
             try:
@@ -653,7 +695,7 @@ class DiscordBackend(ErrBot):
             except ValueError:
                 log.error(f"Invalid guild ID in room specification: {room}")
                 return None
-        
+
         # Get the target guild
         if guild_id:
             guild = DiscordBackend.client.get_guild(guild_id)
@@ -670,8 +712,6 @@ class DiscordBackend(ErrBot):
             return DiscordRoom(room_name[1:], guild.id)
         else:
             return DiscordRoom(room_name, guild.id)
-
-
 
     def send_message(self, msg: Message):
         super().send_message(msg)
@@ -698,26 +738,28 @@ class DiscordBackend(ErrBot):
         ]:
             try:
                 # Check if message should be sent to a thread
-                if hasattr(msg, 'extras') and msg.extras and msg.extras.get('thread_id'):
-                    thread_id = msg.extras['thread_id']
+                if hasattr(msg, "extras") and msg.extras and msg.extras.get("thread_id"):
+                    thread_id = msg.extras["thread_id"]
                     thread = DiscordBackend.client.get_channel(int(thread_id))
                     if thread and isinstance(thread, discord.Thread):
                         self._safe_run_coroutine(
-                            self._retry_operation(thread.send, "send_message_to_thread", content=message),
-                            "send_message_to_thread"
+                            self._retry_operation(
+                                thread.send, "send_message_to_thread", content=message
+                            ),
+                            "send_message_to_thread",
                         )
                         log.debug(f"Sent message to thread {thread_id}")
                     else:
                         log.warning(f"Thread {thread_id} not found, sending to regular channel")
                         self._safe_run_coroutine(
                             self._retry_operation(msg.to.send, "send_message", content=message),
-                            "send_message"
+                            "send_message",
                         )
                 else:
                     # Regular message sending
                     self._safe_run_coroutine(
                         self._retry_operation(msg.to.send, "send_message", content=message),
-                        "send_message"
+                        "send_message",
                     )
             except Exception as e:
                 log.error(f"Failed to send message to {msg.to}: {e}")
@@ -739,31 +781,39 @@ class DiscordBackend(ErrBot):
         # Create a mock message for rate limiting check
         mock_msg = Message("")
         mock_msg.to = recipient
-        
+
         # Check rate limiting before sending
         if not self._should_send_message(mock_msg):
             log.debug(f"Card to {recipient} dropped due to rate limiting")
             return
 
         # Basic embed creation (core functionality)
-        em = discord.Embed(
-            title=card.title or None,
-            description=card.body or None
-        )
+        em = discord.Embed(title=card.title or None, description=card.body or None)
 
         try:
             self._safe_run_coroutine(
                 self._retry_operation(recipient.send, "send_card", embed=em),
                 "send_card",
-                timeout=5.0
+                timeout=5.0,
             )
         except Exception as e:
             log.error(f"Failed to send card to {recipient}: {e}")
             # Don't re-raise to prevent bot from crashing on card send failures
 
-    def send_discord_embed(self, recipient, title=None, description=None, color=None, 
-                          fields=None, image=None, thumbnail=None, footer=None, 
-                          author=None, url=None, timestamp=None):
+    def send_discord_embed(
+        self,
+        recipient,
+        title=None,
+        description=None,
+        color=None,
+        fields=None,
+        image=None,
+        thumbnail=None,
+        footer=None,
+        author=None,
+        url=None,
+        timestamp=None,
+    ):
         """
         Send a Discord embed with full Discord-specific features.
         This is the backend API for plugins to create rich embeds.
@@ -774,7 +824,7 @@ class DiscordBackend(ErrBot):
         # Create a mock message for rate limiting check
         mock_msg = Message("")
         mock_msg.to = recipient
-        
+
         # Check rate limiting before sending
         if not self._should_send_message(mock_msg):
             log.debug(f"Discord embed to {recipient} dropped due to rate limiting")
@@ -783,11 +833,7 @@ class DiscordBackend(ErrBot):
         try:
             # Create Discord embed
             em = discord.Embed(
-                title=title,
-                description=description,
-                color=color,
-                url=url,
-                timestamp=timestamp
+                title=title, description=description, color=color, url=url, timestamp=timestamp
             )
 
             # Add fields
@@ -795,15 +841,15 @@ class DiscordBackend(ErrBot):
                 for field in fields:
                     if isinstance(field, dict):
                         em.add_field(
-                            name=field.get('name', 'Field'),
-                            value=field.get('value', 'Value'),
-                            inline=field.get('inline', True)
+                            name=field.get("name", "Field"),
+                            value=field.get("value", "Value"),
+                            inline=field.get("inline", True),
                         )
                     elif isinstance(field, (list, tuple)) and len(field) >= 2:
                         em.add_field(
                             name=field[0],
                             value=field[1],
-                            inline=field[2] if len(field) > 2 else True
+                            inline=field[2] if len(field) > 2 else True,
                         )
 
             # Add image
@@ -817,10 +863,7 @@ class DiscordBackend(ErrBot):
             # Add footer
             if footer:
                 if isinstance(footer, dict):
-                    em.set_footer(
-                        text=footer.get('text', ''),
-                        icon_url=footer.get('icon_url')
-                    )
+                    em.set_footer(text=footer.get("text", ""), icon_url=footer.get("icon_url"))
                 else:
                     em.set_footer(text=str(footer))
 
@@ -828,9 +871,9 @@ class DiscordBackend(ErrBot):
             if author:
                 if isinstance(author, dict):
                     em.set_author(
-                        name=author.get('name', ''),
-                        url=author.get('url'),
-                        icon_url=author.get('icon_url')
+                        name=author.get("name", ""),
+                        url=author.get("url"),
+                        icon_url=author.get("icon_url"),
                     )
                 else:
                     em.set_author(name=str(author))
@@ -839,7 +882,7 @@ class DiscordBackend(ErrBot):
             self._safe_run_coroutine(
                 self._retry_operation(recipient.send, "send_discord_embed", embed=em),
                 "send_discord_embed",
-                timeout=5.0
+                timeout=5.0,
             )
             return True
 
@@ -859,33 +902,33 @@ class DiscordBackend(ErrBot):
 
             response.frm = DiscordRoomOccupant(self.bot_identifier.id, mess.frm.room.id)
             response.to = DiscordPerson(mess.frm.id) if private else mess.to
-            
+
             # Handle thread support
-            if threaded and hasattr(mess, 'extras') and mess.extras:
+            if threaded and hasattr(mess, "extras") and mess.extras:
                 # Check if the original message has thread information
-                thread_id = mess.extras.get('thread_id')
-                discord_msg_id = mess.extras.get('discord_message_id')
-                
+                thread_id = mess.extras.get("thread_id")
+                discord_msg_id = mess.extras.get("discord_message_id")
+
                 if thread_id:
                     # Reply in existing thread
                     response.extras = response.extras or {}
-                    response.extras['thread_id'] = thread_id
+                    response.extras["thread_id"] = thread_id
                     log.debug(f"Replying in existing thread {thread_id}")
                 elif discord_msg_id and not mess.is_direct:
                     # Create a new thread from the original message
                     try:
-                        thread_name = f"Reply to {mess.frm.nick}" if hasattr(mess.frm, 'nick') else "Thread"
+                        thread_name = (
+                            f"Reply to {mess.frm.nick}" if hasattr(mess.frm, "nick") else "Thread"
+                        )
                         thread_id = self._create_thread_from_message(discord_msg_id, thread_name)
                         if thread_id:
                             response.extras = response.extras or {}
-                            response.extras['thread_id'] = thread_id
+                            response.extras["thread_id"] = thread_id
                             log.debug(f"Created new thread {thread_id} for threaded reply")
                     except Exception as e:
                         log.warning(f"Failed to create thread for reply: {e}")
-                        
+
         return response
-
-
 
     def config_intents(self):
         """
@@ -1022,27 +1065,25 @@ class DiscordBackend(ErrBot):
         log.debug(f'Presence changed to {status} and activity "{message}".')
         try:
             activity = discord.Activity(name=message) if message else None
-            
+
             async def update_presence():
                 return await self._retry_operation(
                     DiscordBackend.client.change_presence,
                     "change_presence",
                     status=status,
-                    activity=activity
+                    activity=activity,
                 )
-            
+
             self._safe_run_coroutine(update_presence(), "change_presence")
-            
+
         except Exception as e:
             log.error(f"Failed to change presence: {e}")
             # Don't re-raise to prevent bot from crashing on presence change failures
 
-
-
     def add_reaction(self, msg: Message, reaction: str) -> None:
         """
         Add a reaction to a message.
-        
+
         Args:
             msg: The message to react to
             reaction: The reaction emoji (unicode emoji or custom emoji name)
@@ -1053,25 +1094,23 @@ class DiscordBackend(ErrBot):
             if discord_msg is None:
                 log.error(f"Could not find Discord message to react to")
                 return
-            
+
             # Add the reaction
             async def add_reaction_async():
                 return await self._retry_operation(
-                    discord_msg.add_reaction,
-                    "add_reaction",
-                    reaction
+                    discord_msg.add_reaction, "add_reaction", reaction
                 )
-            
+
             self._safe_run_coroutine(add_reaction_async(), "add_reaction")
             log.debug(f"Added reaction {reaction} to message {discord_msg.id}")
-            
+
         except Exception as e:
             log.error(f"Failed to add reaction {reaction}: {e}")
 
     def remove_reaction(self, msg: Message, reaction: str) -> None:
         """
         Remove a reaction from a message.
-        
+
         Args:
             msg: The message to remove reaction from
             reaction: The reaction emoji to remove
@@ -1082,26 +1121,26 @@ class DiscordBackend(ErrBot):
             if discord_msg is None:
                 log.error(f"Could not find Discord message to remove reaction from")
                 return
-            
+
             # Remove the reaction (bot's own reaction)
             async def remove_reaction_async():
                 return await self._retry_operation(
                     discord_msg.remove_reaction,
                     "remove_reaction",
                     reaction,
-                    DiscordBackend.client.user
+                    DiscordBackend.client.user,
                 )
-            
+
             self._safe_run_coroutine(remove_reaction_async(), "remove_reaction")
             log.debug(f"Removed reaction {reaction} from message {discord_msg.id}")
-            
+
         except Exception as e:
             log.error(f"Failed to remove reaction {reaction}: {e}")
 
     def _cache_message(self, errbot_msg_id: str, discord_msg: discord.Message) -> None:
         """
         Cache a Discord message for later lookup.
-        
+
         Args:
             errbot_msg_id: The errbot message identifier
             discord_msg: The Discord message object
@@ -1112,22 +1151,22 @@ class DiscordBackend(ErrBot):
                 # Remove oldest entry (first inserted)
                 oldest_key = next(iter(self._message_cache))
                 del self._message_cache[oldest_key]
-            
+
             self._message_cache[errbot_msg_id] = discord_msg
 
     def _get_discord_message_from_errbot_message(self, msg: Message):
         """
         Helper method to get Discord message object from errbot Message.
-        
+
         Args:
             msg: The errbot Message object
-            
+
         Returns:
             Discord message object or None if not found
         """
         # Try to get message ID from extras
-        if hasattr(msg, 'extras') and msg.extras:
-            discord_msg_id = msg.extras.get('discord_message_id')
+        if hasattr(msg, "extras") and msg.extras:
+            discord_msg_id = msg.extras.get("discord_message_id")
             if discord_msg_id:
                 try:
                     # Try to fetch the message from Discord
@@ -1147,24 +1186,26 @@ class DiscordBackend(ErrBot):
                                 channel = user.dm_channel or await user.create_dm()
                             else:
                                 return None
-                        
+
                         if channel:
                             return await channel.fetch_message(int(discord_msg_id))
                         return None
-                    
+
                     return self._safe_run_coroutine(fetch_message(), "fetch_message_for_reaction")
-                    
+
                 except Exception as e:
                     log.debug(f"Could not fetch Discord message {discord_msg_id}: {e}")
-        
+
         # Check message cache
         msg_cache_key = f"{msg.to}:{getattr(msg, 'body', '')[:50]}"  # Simple cache key
         with self._message_cache_lock:
             cached_msg = self._message_cache.get(msg_cache_key)
             if cached_msg:
                 return cached_msg
-        
-        log.debug("Could not find Discord message for reaction. Message may be too old or not sent by this bot.")
+
+        log.debug(
+            "Could not find Discord message for reaction. Message may be too old or not sent by this bot."
+        )
         return None
 
     def prefix_groupchat_reply(self, message, identifier: Person):
@@ -1246,16 +1287,14 @@ class DiscordBackend(ErrBot):
                     dest = msg.to.get_discord_object()
 
                 log.info(f"Sending file {filename} to user {msg.frm}")
-                
+
                 async def send_file():
                     return await self._retry_operation(
-                        dest.send, 
-                        "upload_file", 
-                        file=discord.File(f, filename=filename)
+                        dest.send, "upload_file", file=discord.File(f, filename=filename)
                     )
-                
+
                 self._safe_run_coroutine(send_file(), "upload_file")
-                
+
         except FileNotFoundError:
             log.error(f"File not found: {filename}")
             raise
@@ -1269,7 +1308,7 @@ class DiscordBackend(ErrBot):
     def history(self, channelname, before=None):
         try:
             mychannel = discord.utils.get(self.client.get_all_channels(), name=channelname)
-            
+
             if mychannel is None:
                 log.error(f"Channel '{channelname}' not found")
                 return []
@@ -1277,14 +1316,11 @@ class DiscordBackend(ErrBot):
             async def gethist(mychannel, before=None):
                 async def get_history():
                     return [i async for i in mychannel.history(limit=10, before=before)]
-                
-                return await self._retry_operation(
-                    get_history,
-                    "history"
-                )
+
+                return await self._retry_operation(get_history, "history")
 
             return self._safe_run_coroutine(gethist(mychannel, before), "history")
-            
+
         except Exception as e:
             log.error(f"Failed to get history for channel '{channelname}': {e}")
             return []

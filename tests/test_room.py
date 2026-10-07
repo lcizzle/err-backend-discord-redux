@@ -1,9 +1,8 @@
 import logging
 
 import pytest
-from mock import MagicMock
-
 from discordlib.room import DiscordRoom
+from mock import MagicMock
 
 log = logging.getLogger(__name__)
 
@@ -18,26 +17,35 @@ def discord_room():
 def test_create_room_without_arguments():
     with pytest.raises(ValueError) as excinfo:
         DiscordRoom()
-    assert "A name or channel id + guild id is required to create a Room." in str(excinfo.value)
+    assert "A channel id or channel name + guild id is required for a Room." in str(excinfo.value)
 
 
 def test_create_room_with_name_only():
     with pytest.raises(ValueError) as excinfo:
         DiscordRoom(channel_name="#testing_ground")
-    assert "A name or channel id + guild id is required to create a Room." in str(excinfo.value)
+    assert "A channel id or channel name + guild id is required for a Room." in str(excinfo.value)
 
 
 def test_create_room_with_guild_only():
     with pytest.raises(ValueError) as excinfo:
         DiscordRoom(guild_id="1234567890123456789")
-    assert "A name or channel id + guild id is required to create a Room." in str(excinfo.value)
+    assert "A channel id or channel name + guild id is required for a Room." in str(excinfo.value)
 
 
 def test_create_room_with_id(discord_room):
+    mock_channel = MagicMock()
+    mock_channel.id = 1234567890132456789
+    discord_room.client.get_channel.return_value = mock_channel
     room = discord_room(channel_id="1234567890132456789")
     assert room.id == 1234567890132456789
 
 
 def test_create_room_with_name_and_guild_id(discord_room):
+    mock_channel = MagicMock()
+    mock_channel.id = 1234567890132456789
+    mock_channel.name = "#testing_ground"
+    mock_guild = MagicMock()
+    mock_guild.channels = [mock_channel]
+    discord_room.client.get_guild.return_value = mock_guild
     room = discord_room(channel_name="#testing_ground", guild_id="2345678901234567890")
     assert room.id == 1234567890132456789

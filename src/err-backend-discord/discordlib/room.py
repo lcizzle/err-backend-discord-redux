@@ -3,9 +3,8 @@ import logging
 import sys
 from typing import List, Optional, Union
 
-from errbot.backends.base import Room, RoomError, RoomOccupant
-
 from discordlib.person import DiscordPerson, DiscordSender
+from errbot.backends.base import Room, RoomError, RoomOccupant
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +57,7 @@ class DiscordRoom(Room, DiscordSender):
                         f"More than one channel matched {channel_name} in guild {guild.name}"
                     )
                 self.discord_channel = channel[0]
+                self._channel_id = self.discord_channel.id
             else:
                 raise ValueError(f"Failed to get guild id {guild_id}")
         else:
@@ -177,24 +177,24 @@ class DiscordRoom(Room, DiscordSender):
     def topic(self, new_topic: str) -> None:
         """
         Set the channel topic.
-        
+
         Args:
             new_topic: The new topic to set
         """
         if not self.exists:
             raise RoomError("Cannot set topic for non-existent channel")
-        
+
         try:
+
             async def set_topic_async():
                 await self.discord_channel.edit(topic=new_topic)
-            
+
             asyncio.run_coroutine_threadsafe(
-                set_topic_async(), 
-                loop=DiscordRoom.client.loop
+                set_topic_async(), loop=DiscordRoom.client.loop
             ).result(timeout=10)
-            
+
             log.info(f"Set topic for channel {self.name}: '{new_topic}'")
-            
+
         except Exception as e:
             log.error(f"Failed to set topic for channel {self.name}: {e}")
             raise RoomError(f"Failed to set topic: {e}")

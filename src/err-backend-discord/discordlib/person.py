@@ -103,10 +103,7 @@ class DiscordPerson(Person, DiscordSender):
         return self.discord_user.name
 
     nick = username
-
-    @property
-    def client(self) -> None:
-        return None
+    client = None
 
     @property
     def fullname(self) -> str:

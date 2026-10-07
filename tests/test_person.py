@@ -1,102 +1,82 @@
-import json
 import logging
-import os
-import sys
-
-from errbot.backends.base import RoomDoesNotExistError
 
 import pytest
-from mock import MagicMock
-
 from discordlib.person import DiscordPerson
+from mock import MagicMock
 
 log = logging.getLogger(__name__)
 
 
-@pytest.fixture
-def person():
-    return MagicMock()
+@pytest.fixture(autouse=True)
+def setup_discord_client():
+    mock_client = MagicMock()
+    mock_user = MagicMock()
+    mock_user.id = 123456789012345678
+    mock_user.name = "someone"
+    mock_user.discriminator = "0"
+    mock_client.get_user.return_value = mock_user
+    mock_client.get_all_members.return_value = [mock_user]
+
+    original_client = DiscordPerson.client
+    DiscordPerson.client = mock_client
+    yield mock_client
+    DiscordPerson.client = original_client
 
 
 def test_wrong_userid():
-    raise NotImplementedError
+    with pytest.raises(ValueError, match="Invalid Discord user id"):
+        DiscordPerson(user_id="invalid_id")
 
 
 def test_create_person_without_args():
-    DiscordPerson(user_id="0123456789012345678")
+    with pytest.raises(ValueError, match="Username/discrimator pair or user id not provided."):
+        DiscordPerson()
 
 
 def test_create_person_with_username_only():
-    DiscordPerson(username="someone")
+    person = DiscordPerson(username="someone")
+    assert person.username == "someone"
 
 
 def test_create_person_with_discriminator_only():
-    DiscordPerson(discriminator="#1234")
+    with pytest.raises(ValueError, match="Username/discrimator pair or user id not provided."):
+        DiscordPerson(discriminator="#1234")
 
 
 def test_create_person_with_id():
-    DiscordPerson(user_id="0123456789012345678")
+    person = DiscordPerson(user_id="0123456789012345678")
+    assert person.id == 123456789012345678
 
 
-def test_create_person_username_and_discriminator():
-    DiscordPerson(username="someone", discriminator="1234")
+def test_create_person_username_and_discriminator(setup_discord_client):
+    mock_user = setup_discord_client.get_user.return_value
+    mock_user.discriminator = "1234"
+    person = DiscordPerson(username="someone", discriminator="1234")
+    assert person.id == 123456789012345678
+    assert person.fullname == "someone#1234"
 
 
-def todo_wrong_channelid():
-    raise NotImplementedError
+def test_username_not_found(setup_discord_client):
+    setup_discord_client.get_all_members.return_value = []
+    with pytest.raises(LookupError, match="The user nonexistent#1234 can't be found."):
+        DiscordPerson(username="nonexistent", discriminator="1234")
 
 
-def todo_username():
-    raise NotImplementedError
+def test_user_not_found_by_id(setup_discord_client):
+    setup_discord_client.get_user.return_value = None
+    with pytest.raises(ValueError, match="Failed to get the user"):
+        DiscordPerson(user_id="123456789012345678")
 
 
-def todo_username_not_found():
-    raise NotImplementedError
+def test_person_properties():
+    person = DiscordPerson(user_id="0123456789012345678")
+    assert person.email == "Unavailable"
+    assert person.aclattr == "someone#0"
+    assert str(person) == "someone#0"
+    assert person.nick == "someone"
 
 
-def todo_fullname():
-    raise NotImplementedError
-
-
-def todo_fullname_not_found():
-    raise NotImplementedError
-
-
-def todo_email():
-    raise NotImplementedError
-
-
-def todo_email_not_found():
-    raise NotImplementedError
-
-
-def todo_channelname():
-    raise NotImplementedError
-
-
-def todo_channelname_channel_not_found():
-    raise NotImplementedError
-
-
-def todo_domain():
-    raise NotImplementedError
-
-
-def todo_aclattr():
-    raise NotImplementedError
-
-
-def todo_person():
-    raise NotImplementedError
-
-
-def todo_to_string():
-    raise NotImplementedError
-
-
-def todo_equal():
-    raise NotImplementedError
-
-
-def todo_hash():
-    raise NotImplementedError
+def test_person_equality():
+    p1 = DiscordPerson(user_id="0123456789012345678")
+    p2 = DiscordPerson(user_id="0123456789012345678")
+    assert p1 == p2
