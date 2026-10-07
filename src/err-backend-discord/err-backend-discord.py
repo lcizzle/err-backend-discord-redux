@@ -1,13 +1,21 @@
 import asyncio
+import inspect
 import logging
 import sys
 import time
 from collections import defaultdict, deque
 from threading import Lock
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, Optional, Union
 
 from discordlib.person import DiscordPerson, DiscordSender
 from discordlib.room import DiscordCategory, DiscordRoom, DiscordRoomOccupant
+from discordlib.ui import (
+    ActionRowView,
+    SimpleButton,
+    SimpleModal,
+    SimpleSelect,
+    is_interaction_handled,
+)
 from errbot.backends.base import (
     AWAY,
     DND,
@@ -87,6 +95,9 @@ class DiscordBackend(ErrBot):
         self._message_cache_lock = Lock()
         self._max_cached_messages = config.BOT_IDENTITY.get("max_cached_messages", 1000)
         self._thread_cache: Dict[str, discord.Thread] = {}
+        # Interactive UI component and modal tracking
+        self._active_component_items: Dict[str, discord.ui.Item] = {}
+        self._active_modals: Dict[str, discord.ui.Modal] = {}
 
     async def _retry_operation(self, operation, operation_name: str, *args, **kwargs):
         """
@@ -155,11 +166,32 @@ class DiscordBackend(ErrBot):
         timeout = timeout or self.timeout
 
         try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if (
+            current_loop is not None
+            and DiscordBackend.client
+            and current_loop == DiscordBackend.client.loop
+        ):
+            # We are ALREADY on the Discord client's event loop thread!
+            # Blocking on future.result() here would freeze the event loop and cause a deadlock.
+            return current_loop.create_task(coro)
+
+        try:
             # Use asyncio.run_coroutine_threadsafe but don't block waiting for result
             future = asyncio.run_coroutine_threadsafe(coro, loop=DiscordBackend.client.loop)
 
             # For non-critical operations, don't wait for completion to avoid blocking
-            if operation_name in ["send_message", "send_card", "add_reaction", "remove_reaction"]:
+            if operation_name in [
+                "send_message",
+                "send_card",
+                "send_ui",
+                "send_modal",
+                "add_reaction",
+                "remove_reaction",
+            ]:
                 # Schedule the operation but don't wait for it
                 def handle_result(fut):
                     try:
@@ -181,6 +213,46 @@ class DiscordBackend(ErrBot):
         except Exception as e:
             log.error(f"{operation_name} failed: {e}")
             raise
+
+    def _prepare_view(self, view: Optional[discord.ui.View]) -> None:
+        """
+        Ensure view has an active __stopped future on the Discord client loop.
+        discord.py's BaseView sets __stopped to None when created outside an active asyncio loop,
+        which causes discord.py to silently drop all component interactions.
+        """
+        if view is None:
+            return
+
+        client = DiscordBackend.client
+        loop = client.loop if client else None
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+        if loop:
+            stopped = getattr(view, "_BaseView__stopped", None)
+            if stopped is None or stopped.done() or getattr(stopped, "_loop", None) != loop:
+                try:
+                    view._BaseView__stopped = loop.create_future()
+                except Exception as e:
+                    log.debug(f"Could not set _BaseView__stopped: {e}")
+
+    def _register_view_components(self, view: Optional[discord.ui.View]) -> None:
+        """
+        Prepare and register all interactive items within a view in our backend tracking cache
+        and discord.py's view store to ensure components dispatch correctly.
+        """
+        if view is None:
+            return
+        self._prepare_view(view)
+
+        # Cache items for direct fallback handling in on_interaction
+        for item in getattr(view, "children", []):
+            custom_id = getattr(item, "custom_id", None)
+            if custom_id:
+                self._active_component_items[str(custom_id)] = item
 
     def _clean_old_requests(self, request_queue: Deque[float]) -> None:
         """
@@ -507,7 +579,16 @@ class DiscordBackend(ErrBot):
                 plugin_name = getattr(plugin, "name", str(plugin))
                 log.debug("Triggering %s on %s.", method, plugin_name)
                 try:
-                    getattr(plugin, method)(*args, **kwargs)
+                    res = getattr(plugin, method)(*args, **kwargs)
+                    if inspect.iscoroutine(res):
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(res)
+                        except RuntimeError:
+                            if DiscordBackend.client and DiscordBackend.client.loop:
+                                asyncio.run_coroutine_threadsafe(
+                                    res, loop=DiscordBackend.client.loop
+                                )
                 except Exception:
                     log.exception("%s on %s crashed.", method, plugin_name)
 
@@ -885,6 +966,64 @@ class DiscordBackend(ErrBot):
         except Exception as e:
             log.error(f"Error processing channel update event: {e}")
 
+    async def on_interaction(self, interaction: discord.Interaction):
+        """
+        Interaction event handler.
+        Called whenever a Discord interaction (buttons, select menus, modals, application commands) is received.
+        Dispatches callback_interaction to plugins.
+        """
+        try:
+            interaction_type = getattr(interaction, "type", None)
+            custom_id = None
+            if hasattr(interaction, "data") and isinstance(interaction.data, dict):
+                custom_id = interaction.data.get("custom_id")
+
+            log.debug(
+                f"Interaction received: type={interaction_type}, user={interaction.user} "
+                f"(ID: {getattr(interaction.user, 'id', None)}), custom_id={custom_id}"
+            )
+
+            # Direct fallback dispatch if discord.py's view store did not handle it
+            if interaction.type == discord.InteractionType.component and custom_id:
+                if custom_id in self._active_component_items:
+                    item = self._active_component_items[custom_id]
+                    if not is_interaction_handled(interaction):
+                        try:
+                            if hasattr(item, "_refresh_state"):
+                                item._refresh_state(interaction, interaction.data)
+                        except Exception:
+                            pass
+                        try:
+                            res = item.callback(interaction)
+                            if inspect.iscoroutine(res):
+                                await res
+                        except Exception as e:
+                            log.exception(
+                                f"Error in direct component callback for {custom_id}: {e}"
+                            )
+
+            elif interaction.type == discord.InteractionType.modal_submit and custom_id:
+                if custom_id in self._active_modals:
+                    modal = self._active_modals[custom_id]
+                    if not is_interaction_handled(interaction):
+                        try:
+                            components = interaction.data.get("components", [])
+                            for row in components:
+                                for comp in row.get("components", []):
+                                    cid = comp.get("custom_id")
+                                    val = comp.get("value")
+                                    if cid in getattr(modal, "inputs", {}):
+                                        modal.inputs[cid]._value = val
+                            res = modal.on_submit(interaction)
+                            if inspect.iscoroutine(res):
+                                await res
+                        except Exception as e:
+                            log.exception(f"Error in direct modal callback for {custom_id}: {e}")
+
+            self._dispatch_to_plugins("callback_interaction", interaction)
+        except Exception as e:
+            log.error(f"Error handling interaction event: {e}")
+
     def query_room(self, room):
         """
         Query room with multi-guild support.
@@ -969,10 +1108,23 @@ class DiscordBackend(ErrBot):
             f" is_direct:{msg.is_direct} extras: {msg.extras} size: {len(msg.body)}"
         )
 
-        for message in [
+        view = None
+        if hasattr(msg, "extras") and isinstance(msg.extras, dict):
+            view = msg.extras.get("view")
+        if view is not None:
+            self._register_view_components(view)
+
+        chunks = [
             msg.body[i : i + self.message_size_limit]
             for i in range(0, len(msg.body), self.message_size_limit)
-        ]:
+        ]
+        if not chunks and (view is not None):
+            chunks = [""]
+
+        for idx, message in enumerate(chunks):
+            chunk_view = view if (idx == len(chunks) - 1) else None
+            if chunk_view is not None:
+                self._register_view_components(chunk_view)
             try:
                 # Check if message should be sent to a thread
                 if hasattr(msg, "extras") and msg.extras and msg.extras.get("thread_id"):
@@ -990,23 +1142,38 @@ class DiscordBackend(ErrBot):
                         except Exception as e:
                             log.debug(f"Failed to fetch thread {thread_id}: {e}")
                     if thread and isinstance(thread, discord.Thread):
+                        send_kwargs = {"content": message} if message else {}
+                        if chunk_view is not None:
+                            send_kwargs["view"] = chunk_view
+                        if not send_kwargs:
+                            send_kwargs["content"] = ""
                         self._safe_run_coroutine(
                             self._retry_operation(
-                                thread.send, "send_message_to_thread", content=message
+                                thread.send, "send_message_to_thread", **send_kwargs
                             ),
                             "send_message_to_thread",
                         )
                         log.debug(f"Sent message to thread {thread_id}")
                     else:
                         log.warning(f"Thread {thread_id} not found, sending to regular channel")
+                        send_kwargs = {"content": message} if message else {}
+                        if chunk_view is not None:
+                            send_kwargs["view"] = chunk_view
+                        if not send_kwargs:
+                            send_kwargs["content"] = ""
                         self._safe_run_coroutine(
-                            self._retry_operation(msg.to.send, "send_message", content=message),
+                            self._retry_operation(msg.to.send, "send_message", **send_kwargs),
                             "send_message",
                         )
                 else:
                     # Regular message sending
+                    send_kwargs = {"content": message} if message else {}
+                    if chunk_view is not None:
+                        send_kwargs["view"] = chunk_view
+                    if not send_kwargs:
+                        send_kwargs["content"] = ""
                     self._safe_run_coroutine(
-                        self._retry_operation(msg.to.send, "send_message", content=message),
+                        self._retry_operation(msg.to.send, "send_message", **send_kwargs),
                         "send_message",
                     )
             except Exception as e:
@@ -1038,9 +1205,18 @@ class DiscordBackend(ErrBot):
         # Basic embed creation (core functionality)
         em = discord.Embed(title=card.title or None, description=card.body or None)
 
+        view = getattr(card, "view", None)
+        if view is None and hasattr(card, "extras") and isinstance(card.extras, dict):
+            view = card.extras.get("view")
+
+        send_kwargs = {"embed": em}
+        if view is not None:
+            self._register_view_components(view)
+            send_kwargs["view"] = view
+
         try:
             self._safe_run_coroutine(
-                self._retry_operation(recipient.send, "send_card", embed=em),
+                self._retry_operation(recipient.send, "send_card", **send_kwargs),
                 "send_card",
                 timeout=5.0,
             )
@@ -1061,6 +1237,7 @@ class DiscordBackend(ErrBot):
         author=None,
         url=None,
         timestamp=None,
+        view=None,
     ):
         """
         Send a Discord embed with full Discord-specific features.
@@ -1126,9 +1303,14 @@ class DiscordBackend(ErrBot):
                 else:
                     em.set_author(name=str(author))
 
+            send_kwargs = {"embed": em}
+            if view is not None:
+                self._register_view_components(view)
+                send_kwargs["view"] = view
+
             # Send the embed
             self._safe_run_coroutine(
-                self._retry_operation(recipient.send, "send_discord_embed", embed=em),
+                self._retry_operation(recipient.send, "send_discord_embed", **send_kwargs),
                 "send_discord_embed",
                 timeout=5.0,
             )
@@ -1138,8 +1320,151 @@ class DiscordBackend(ErrBot):
             log.error(f"Failed to send Discord embed to {recipient}: {e}")
             return False
 
-    def build_reply(self, mess, text=None, private=False, threaded=False):
+    def send_ui(
+        self,
+        recipient,
+        content: Optional[str] = None,
+        embed: Optional[discord.Embed] = None,
+        view: Optional[discord.ui.View] = None,
+        ephemeral: bool = False,
+    ):
+        """
+        Send an interactive UI component (buttons, selects, views) to a recipient.
+
+        Args:
+            recipient: Target recipient. Can be DiscordSender, Message, discord.Interaction, or int/str ID.
+            content: Text message content.
+            embed: Discord Embed to attach.
+            view: Discord View containing buttons, selects, etc.
+            ephemeral: Only valid if recipient is discord.Interaction. If True, only visible to the user.
+        """
+        # Register view if provided
+        if view is not None:
+            self._register_view_components(view)
+
+        # If recipient is an Interaction:
+        if isinstance(recipient, discord.Interaction):
+
+            async def respond_interaction():
+                if recipient.response.is_done():
+                    return await recipient.followup.send(
+                        content=content, embed=embed, view=view, ephemeral=ephemeral
+                    )
+                else:
+                    return await recipient.response.send_message(
+                        content=content, embed=embed, view=view, ephemeral=ephemeral
+                    )
+
+            return self._safe_run_coroutine(respond_interaction(), "send_ui_interaction")
+
+        # If recipient is an Errbot Message:
+        if isinstance(recipient, Message):
+            if (
+                hasattr(recipient, "extras")
+                and recipient.extras
+                and recipient.extras.get("thread_id")
+            ):
+                thread_id = recipient.extras["thread_id"]
+                target_room = DiscordRoom.from_id(thread_id)
+                recipient = target_room
+            elif isinstance(recipient.to, DiscordSender):
+                recipient = recipient.to
+            elif isinstance(recipient.frm, DiscordSender):
+                recipient = recipient.frm
+
+        # If recipient is channel ID or int/str:
+        if isinstance(recipient, (int, str)):
+            try:
+                recipient = DiscordRoom.from_id(recipient)
+            except Exception as e:
+                log.warning(f"Failed to resolve recipient from ID {recipient}: {e}")
+                cid = int(recipient)
+                ch = (
+                    DiscordBackend.client.get_channel(cid) if DiscordBackend.client else None
+                ) or (DiscordBackend.client.get_user(cid) if DiscordBackend.client else None)
+                if ch:
+
+                    async def send_direct():
+                        send_kwargs = {}
+                        if content is not None:
+                            send_kwargs["content"] = content
+                        if embed is not None:
+                            send_kwargs["embed"] = embed
+                        if view is not None:
+                            send_kwargs["view"] = view
+                        return await ch.send(**send_kwargs)
+
+                    return self._safe_run_coroutine(send_direct(), "send_ui_direct")
+                raise ValueError(f"Could not resolve recipient ID: {recipient}")
+
+        if not isinstance(recipient, DiscordSender):
+            raise TypeError(
+                f"send_ui recipient must be DiscordSender, Message, discord.Interaction, or ID, got {type(recipient)}"
+            )
+
+        # Create mock message for rate limiting check
+        mock_msg = Message(content or "")
+        mock_msg.to = recipient
+        if not self._should_send_message(mock_msg):
+            log.debug(f"UI message to {recipient} dropped due to rate limiting")
+            return None
+
+        async def send_ui_async():
+            send_kwargs = {}
+            if content is not None:
+                send_kwargs["content"] = content
+            if embed is not None:
+                send_kwargs["embed"] = embed
+            if view is not None:
+                send_kwargs["view"] = view
+            return await self._retry_operation(recipient.send, "send_ui", **send_kwargs)
+
+        return self._safe_run_coroutine(send_ui_async(), "send_ui")
+
+    def send_modal(self, interaction: discord.Interaction, modal: discord.ui.Modal):
+        """
+        Respond to an interaction by displaying a modal dialog popup.
+
+        Note: Discord requires modals to be sent as the initial response to an interaction.
+        If the interaction is already deferred or answered, a modal cannot be opened.
+
+        Args:
+            interaction: The incoming discord.Interaction
+            modal: The discord.ui.Modal (or SimpleModal) to display
+        """
+        if not isinstance(interaction, discord.Interaction):
+            raise TypeError(f"interaction must be discord.Interaction, got {type(interaction)}")
+        if not isinstance(modal, discord.ui.Modal):
+            raise TypeError(f"modal must be discord.ui.Modal, got {type(modal)}")
+
+        if interaction.response.is_done():
+            log.error("Cannot send modal: Interaction response is already completed or deferred.")
+            return None
+
+        self._prepare_view(modal)
+
+        # Cache modal for direct fallback handling in on_interaction
+        custom_id = getattr(modal, "custom_id", None)
+        if custom_id:
+            self._active_modals[str(custom_id)] = modal
+
+        async def send_modal_async():
+            return await interaction.response.send_modal(modal)
+
+        return self._safe_run_coroutine(send_modal_async(), "send_modal")
+
+    def build_reply(self, mess, text=None, private=False, threaded=False, view=None):
         response = self.build_message(text)
+
+        if view is not None:
+            self._register_view_components(view)
+            if hasattr(response, "_extras") and isinstance(response._extras, dict):
+                response._extras["view"] = view
+            else:
+                try:
+                    response.extras["view"] = view
+                except Exception:
+                    setattr(response, "_extras", {"view": view})
 
         if mess.is_direct:
             response.frm = self.bot_identifier
@@ -1276,6 +1601,7 @@ class DiscordBackend(ErrBot):
             self.on_thread_create,
             self.on_thread_delete,
             self.on_thread_update,
+            self.on_interaction,
         ]:
             DiscordBackend.client.event(func)
 

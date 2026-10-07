@@ -125,6 +125,7 @@ class DiscordPerson(Person, DiscordSender):
         allowed_mentions: discord.AllowedMentions = None,
         reference: Union[discord.Message, discord.MessageReference] = None,
         mention_author: Optional[bool] = None,
+        view: discord.ui.View = None,
     ):
         await self.discord_user.send(
             content=content,
@@ -137,6 +138,7 @@ class DiscordPerson(Person, DiscordSender):
             allowed_mentions=allowed_mentions,
             reference=reference,
             mention_author=mention_author,
+            view=view,
         )
 
     def __eq__(self, other):

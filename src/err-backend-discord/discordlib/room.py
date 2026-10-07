@@ -286,7 +286,12 @@ class DiscordRoom(Room, DiscordSender):
         """
         return self._channel_id
 
-    async def send(self, content: str = None, embed: discord.Embed = None):
+    async def send(
+        self,
+        content: str = None,
+        embed: discord.Embed = None,
+        view: discord.ui.View = None,
+    ):
         if not self.exists:
             raise RuntimeError("Can't send a message on a non-existent channel")
 
@@ -295,19 +300,28 @@ class DiscordRoom(Room, DiscordSender):
             self.discord_channel, discord.ForumChannel
         ):
             thread_name = (content or "New Post").strip().split("\n")[0][:100]
-            await self.discord_channel.create_thread(
-                name=thread_name,
-                content=content or None,
-                embed=embed or None,
-            )
-            return
+            kwargs = {
+                "name": thread_name,
+                "content": content or None,
+                "embed": embed or None,
+            }
+            if view is not None:
+                kwargs["view"] = view
+            return await self.discord_channel.create_thread(**kwargs)
 
         if not isinstance(self.discord_channel, discord.abc.Messageable):
             raise RuntimeError(
                 f"Channel {self.name}[id:{self._channel_id}] doesn't support sending text messages"
             )
 
-        await self.discord_channel.send(content=content, embed=embed)
+        kwargs = {}
+        if content is not None:
+            kwargs["content"] = content
+        if embed is not None:
+            kwargs["embed"] = embed
+        if view is not None:
+            kwargs["view"] = view
+        return await self.discord_channel.send(**kwargs)
 
     def __str__(self):
         return f"<#{self.id}>"
@@ -332,8 +346,14 @@ class DiscordRoomOccupant(DiscordPerson, RoomOccupant):
     def get_discord_object(self) -> discord.abc.Messageable:
         return self._channel.discord_channel
 
-    async def send(self, content: str = None, embed: discord.Embed = None):
-        await self.room.send(content=content, embed=embed)
+    async def send(
+        self,
+        content: str = None,
+        embed: discord.Embed = None,
+        view: discord.ui.View = None,
+        **kwargs,
+    ):
+        await self.room.send(content=content, embed=embed, view=view, **kwargs)
 
     def __eq__(self, other):
         return (
