@@ -105,6 +105,157 @@ guild mentions don't exists but could be represented with a string like ``<$1234
     @username#1234
 
 
+Modern Discord Features & Plugin Development
+------------------------------------------------------------------------
+
+The Redux backend provides modern Discord features (discord.py 2.7+) directly to Errbot plugins.
+
+Interactive UI Components (Buttons, Selects, Modals)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Import UI components directly from ``discordlib.ui``:
+
+::
+
+    from discordlib.ui import ActionRowView, SimpleButton, SimpleSelect, SimpleModal
+    import discord
+
+**1. Sending Interactive Buttons:**
+
+::
+
+    class MyPlugin(BotPlugin):
+        @botcmd
+        def interactive(self, msg, args):
+            view = ActionRowView(timeout=120)
+
+            async def on_confirm(interaction):
+                await interaction.response.send_message("Confirmed!", ephemeral=True)
+
+            btn = SimpleButton(
+                label="Confirm",
+                style=discord.ButtonStyle.success,
+                custom_id="btn_confirm",
+                callback=on_confirm
+            )
+            view.add_item(btn)
+
+            # Send via backend helper or as message extras
+            self._bot.send_ui(msg, content="Please choose an option:", view=view)
+
+**2. Select Dropdowns:**
+
+::
+
+    options = [
+        discord.SelectOption(label="Red", value="red", description="Red color"),
+        discord.SelectOption(label="Blue", value="blue", description="Blue color"),
+    ]
+    select = SimpleSelect(
+        placeholder="Choose a color...",
+        options=options,
+        callback=lambda inter: inter.response.send_message(f"Selected: {inter.data['values'][0]}")
+    )
+    view = ActionRowView().add_item(select)
+    self._bot.send_ui(msg, view=view)
+
+**3. Modal Dialogs:**
+
+Modals must be opened in response to a Discord interaction:
+
+::
+
+    modal = SimpleModal(title="Feedback Form")
+    modal.add_short_input(custom_id="name", label="Your Name", required=True)
+    modal.add_paragraph_input(custom_id="feedback", label="Feedback", max_length=500)
+
+    async def on_submit(interaction, values):
+        await interaction.response.send_message(f"Thanks {values['name']}! Received: {values['feedback']}", ephemeral=True)
+
+    modal.set_on_submit(on_submit)
+    self._bot.send_modal(interaction, modal)
+
+**4. Handling Component Interactions in Plugins:**
+
+Plugins can also observe all incoming interactions by implementing ``callback_interaction``:
+
+::
+
+    def callback_interaction(self, interaction: discord.Interaction):
+        custom_id = interaction.data.get("custom_id")
+        self.log.info(f"Observed interaction {custom_id} by {interaction.user}")
+
+
+Native Application Commands (Slash Commands & Context Menus)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Declare native application commands using decorators from ``discordlib.commands``:
+
+::
+
+    from discordlib.commands import slash_command, message_context_menu, user_context_menu
+
+**1. Slash Commands (``/command``):**
+
+::
+
+    class MyPlugin(BotPlugin):
+        @slash_command(name="ping", description="Check bot latency")
+        async def ping_cmd(self, interaction: discord.Interaction):
+            await interaction.response.send_message("Pong!")
+
+        @slash_command(name="echo", description="Echo back text")
+        async def echo_cmd(self, interaction: discord.Interaction, message: str):
+            await interaction.response.send_message(f"Echo: {message}")
+
+**2. Message & User Context Menus (Right-Click -> Apps):**
+
+::
+
+    @message_context_menu(name="Quote Message")
+    async def quote_msg(self, interaction: discord.Interaction, message: discord.Message):
+        await interaction.response.send_message(f"Quoted: {message.content}", ephemeral=True)
+
+    @user_context_menu(name="Inspect Member")
+    async def inspect_user(self, interaction: discord.Interaction, user: discord.Member):
+        await interaction.response.send_message(f"User ID: {user.id}, Joined: {user.joined_at}", ephemeral=True)
+
+**3. Synchronizing Commands:**
+
+- **Automatic Startup Sync:** Set ``guild_sync_id`` in ``BOT_IDENTITY`` to sync immediately on startup.
+- **On-Demand Command:** Administrators can run ``!sync`` (or ``!sync <guild_id>``) at any time.
+- **Programmatic Sync:** Call ``self._bot.sync_slash_commands(guild_id=...)``.
+
+
+Channel & Thread Lifecycle Callbacks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Plugins can hook into Discord events:
+
+::
+
+    class LifecyclePlugin(BotPlugin):
+        def callback_message_deleted(self, msg):
+            """Fired when a cached message is deleted."""
+            self.log.info(f"Message deleted: {msg.body}")
+
+        def callback_raw_message_deleted(self, msg):
+            """Fired when any message is deleted (cached or uncached)."""
+            self.log.info(f"Raw message deleted ID: {msg.extras.get('discord_message_id')}")
+
+        def callback_thread_created(self, room):
+            self.log.info(f"Thread created: {room.name} ({room.id})")
+
+        def callback_thread_deleted(self, room):
+            self.log.info(f"Thread deleted: {room.name} ({room.id})")
+
+        def callback_thread_updated(self, room, before, after):
+            self.log.info(f"Thread updated: {room.name} (archived={after.archived})")
+
+        def callback_reaction(self, reaction):
+            """Fired on raw reaction additions and removals across all messages."""
+            self.log.info(f"Reaction {reaction.reaction_name} by {reaction.reactor}")
+
 
 Contributing
 ------------------------------------------------------------------------

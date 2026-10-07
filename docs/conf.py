@@ -22,7 +22,7 @@ copyright = "2019-20223, errbot-backend-discord contributors"
 author = "errbot-backend-discord contributors"
 
 # The full version, including alpha/beta/rc tags
-release = "4.0.0"
+release = "4.1.0"
 
 
 # -- General configuration ---------------------------------------------------

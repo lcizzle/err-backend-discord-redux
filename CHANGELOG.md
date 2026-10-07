@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] - 2026-10-08
+
+### Added
+- **Native Application Commands & Context Menus (Phase 4)**:
+  - Integrated `discord.app_commands.CommandTree` with `DiscordBackend`.
+  - Added decorators `@slash_command`, `@message_context_menu`, and `@user_context_menu` in `discordlib.commands`.
+  - Added automatic command registration and unregistration during plugin lifecycle.
+  - Added automatic command bridging (`auto_bridge_commands`) mapping active Errbot `@botcmd` methods into Discord `/commands`.
+  - Added instant guild synchronization via `guild_sync_id` in `BOT_IDENTITY` and `backend.sync_slash_commands(guild_id)`.
+  - Added `!sync [guild_id|'global']` administrative Errbot command.
+  - Added interaction response and followup routing in `send_message()`.
+- **Interactive UI Components (Phase 3)**:
+  - Added `discordlib.ui` module featuring `ActionRowView`, `SimpleButton`, `SimpleSelect`, and `SimpleModal`.
+  - Added backend methods `send_ui(recipient, content, embed, view, ephemeral)` and `send_modal(interaction, modal)`.
+  - Added `callback_interaction(interaction)` plugin hook for observing component interactions.
+  - Added fallback dispatch system for UI views and modal callbacks.
+- **Message & Channel Lifecycle Parity (Phase 2)**:
+  - Added `on_message_delete` and `on_raw_message_delete` handlers dispatching `callback_message_deleted` and `callback_raw_message_deleted`.
+  - Added `on_thread_create`, `on_thread_delete`, and `on_thread_update` handlers dispatching `callback_thread_created`, `callback_thread_deleted`, and `callback_thread_updated`.
+  - Added support for `discord.Thread`, `discord.ForumChannel`, and `discord.StageChannel` in `DiscordRoom` and `query_room()`.
+  - Added automatic forum thread creation when sending messages to Discord forum channels.
+- **Reliable Raw Gateway Reactions & Thread Creation (Phase 1)**:
+  - Migrated reaction processing to raw gateway events (`on_raw_reaction_add` and `on_raw_reaction_remove`) to reliably capture reactions on historical and uncached messages.
+  - Implemented `_create_thread_from_message` with channel API fetching and LRU message caching.
+  - Added LRU cache for recent Discord message objects (`_recent_discord_messages`).
+
+### Changed
+- Bumped `discord.py` dependency requirement to `>=2.7.1,<3.0.0`.
+- Expanded unit test coverage with dedicated test suites (`tests/test_slash.py`, `tests/test_ui.py`) totaling 70 comprehensive tests.
+
 ## [4.0.2]
 
 ### Changed

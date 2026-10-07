@@ -42,6 +42,27 @@ Guild
 Not available.  Such a target will probably not be supported in the future.
 
 
+Using Application Commands (Slash Commands & Context Menus)
+------------------------------------------------------------------------
+
+The Redux backend supports Discord's native Application Commands:
+
+1. **Slash Commands (``/command``):**
+   - Type ``/`` in any channel or direct message to view and execute bot commands with Discord's native autocomplete and typed parameter modals.
+   - If ``auto_bridge_commands`` is enabled in ``config.py``, all standard Errbot ``!commands`` can also be executed as ``/commands``.
+
+2. **Context Menus (Right-Click -> Apps):**
+   - **Message Context Menus**: Right-click any message, navigate to **Apps**, and select the action (e.g. *Quote Message*).
+   - **User Context Menus**: Right-click any user or member in the channel or user list, navigate to **Apps**, and select the action (e.g. *Inspect User*).
+
+3. **Synchronizing Slash Commands (``!sync``):**
+   - Discord slash commands must be synchronized with Discord's API.
+   - Run ``!sync`` in any server channel to instantly register slash commands to the current server.
+   - Run ``!sync <guild_id>`` to register slash commands to a specific server.
+   - Run ``!sync global`` to publish commands globally across all Discord servers (may take up to 1 hour to propagate across Discord).
+
+
+
 Troubleshooting
 ------------------------------------------------------------------------
 

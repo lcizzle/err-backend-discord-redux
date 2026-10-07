@@ -458,7 +458,7 @@ wheels = [
 
 [[package]]
 name = "err-backend-discord-redux"
-version = "4.0.2"
+version = "4.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "discord-py" },
