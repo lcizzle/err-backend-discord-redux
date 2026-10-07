@@ -9,13 +9,32 @@ from errbot.backends.base import Reaction
 
 try:
     import discord
+    from discordlib.commands import message_context_menu, slash_command, user_context_menu
     from discordlib.ui import ActionRowView, SimpleButton, SimpleModal, SimpleSelect
 except ImportError:
     discord = None
+    slash_command = None
+    message_context_menu = None
+    user_context_menu = None
     ActionRowView = None
     SimpleButton = None
     SimpleModal = None
     SimpleSelect = None
+
+
+def _dummy_decorator(*args, **kwargs):
+    def wrapper(f):
+        return f
+
+    return wrapper
+
+
+if slash_command is None:
+    slash_command = _dummy_decorator
+if message_context_menu is None:
+    message_context_menu = _dummy_decorator
+if user_context_menu is None:
+    user_context_menu = _dummy_decorator
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +46,7 @@ class DiscordTest(BotPlugin):
       - Phase 1: Message Extras, LRU Caching, Thread creation, Reactions
       - Phase 2: Message deletion callbacks, Thread lifecycle callbacks, Forum/Stage query_room
       - Phase 3: Interactive UI components (Buttons, Dropdown Selects, Modals, on_interaction)
+      - Phase 4: Native Application Commands (Slash Commands & Context Menus)
     """
 
     def activate(self):
@@ -39,7 +59,26 @@ class DiscordTest(BotPlugin):
         self.thread_history: Deque[dict] = deque(maxlen=20)
         # Ring buffer storing recent interactions observed by callback_interaction
         self.interaction_history: Deque[dict] = deque(maxlen=20)
+
+        # Register native slash commands & context menus with backend CommandTree
+        if hasattr(self._bot, "register_plugin_commands"):
+            try:
+                self._bot.register_plugin_commands(self)
+                log.info("Registered DiscordTest application commands with CommandTree.")
+            except Exception as e:
+                log.warning(f"Could not register application commands: {e}")
+
         log.info("DiscordTest plugin activated.")
+
+    def deactivate(self):
+        # Unregister application commands when plugin deactivated
+        if hasattr(self._bot, "unregister_plugin_commands"):
+            try:
+                self._bot.unregister_plugin_commands(self)
+                log.info("Unregistered DiscordTest application commands from CommandTree.")
+            except Exception as e:
+                log.warning(f"Could not unregister application commands: {e}")
+        super().deactivate()
 
     def callback_reaction(self, reaction: Reaction):
         """
@@ -497,3 +536,146 @@ class DiscordTest(BotPlugin):
                 f"• [{rxn['action'].upper()}] `{rxn['emoji']}` by `{rxn['reactor']}` on message `{rxn['message_id']}` in channel `{rxn['channel_id']}`"
             )
         return "\n".join(lines)
+
+    # =========================================================================
+    # Phase 4: Native Application Commands (Slash Commands & Context Menus)
+    # =========================================================================
+
+    @botcmd(admin_only=True)
+    def sync(self, msg, args):
+        """
+        Manually trigger slash command synchronization with Discord.
+        Usage:
+          !sync             - Sync commands to the current guild immediately
+          !sync <guild_id>  - Sync commands to specified guild immediately
+          !sync global      - Sync commands globally (may take up to 1 hr to propagate)
+        """
+        target = args.strip()
+        guild_id = None
+
+        if target.lower() == "global":
+            guild_id = None
+            scope_desc = "globally (Discord may take up to 1 hour to propagate)"
+        elif target:
+            try:
+                guild_id = int(target)
+                scope_desc = f"to guild `{guild_id}`"
+            except ValueError:
+                return f"❌ Invalid guild ID: `{target}`. Must be an integer or 'global'."
+        else:
+            # Auto-detect current guild
+            if msg.is_direct:
+                return "❌ In DMs, please specify guild ID or 'global': `!sync <guild_id>` or `!sync global`"
+
+            # Get guild ID from room
+            room = msg.frm.room if hasattr(msg.frm, "room") else None
+            guild_id = getattr(room, "guild", None) or getattr(room, "_guild_id", None)
+            if not guild_id and hasattr(msg, "extras") and msg.extras:
+                guild_id = msg.extras.get("guild_id")
+            if not guild_id:
+                client = getattr(self._bot, "client", None)
+                if client and client.guilds:
+                    guild_id = client.guilds[0].id
+
+            if not guild_id:
+                return "❌ Could not determine current guild ID. Please specify: `!sync <guild_id>`"
+            scope_desc = f"to current guild `{guild_id}`"
+
+        backend = self._bot
+        if not hasattr(backend, "sync_slash_commands"):
+            return "❌ Backend does not implement `sync_slash_commands`."
+
+        try:
+            res = backend.sync_slash_commands(guild_id=guild_id)
+            count = len(res) if isinstance(res, (list, tuple)) else "all"
+            return f"✅ Slash command synchronization completed {scope_desc} ({count} commands)."
+        except Exception as e:
+            log.exception(f"Failed to sync slash commands: {e}")
+            return f"❌ Failed to sync slash commands: {e}"
+
+    @slash_command(name="test_ping", description="Ping the bot via native slash command")
+    async def slash_test_ping(self, interaction: discord.Interaction):
+        """Slash command: Ping test."""
+        client = getattr(self._bot, "client", None)
+        latency_ms = (
+            round(client.latency * 1000, 2) if client and hasattr(client, "latency") else "N/A"
+        )
+        await interaction.response.send_message(
+            f"🏓 Pong from native Discord slash command! Gateway latency: `{latency_ms}ms`"
+        )
+
+    @slash_command(name="test_echo", description="Echo back a message via native slash command")
+    async def slash_test_echo(self, interaction: discord.Interaction, message: str):
+        """Slash command: Echo test with arguments."""
+        await interaction.response.send_message(f"📢 Echo: {message}")
+
+    @slash_command(
+        name="test_ui_slash", description="Test interactive UI components in a slash command"
+    )
+    async def slash_test_ui(self, interaction: discord.Interaction):
+        """Slash command: UI button test."""
+        if not ActionRowView or not SimpleButton:
+            await interaction.response.send_message(
+                "❌ discordlib.ui not available.", ephemeral=True
+            )
+            return
+
+        view = ActionRowView(timeout=60)
+
+        async def btn1_cb(inter: discord.Interaction):
+            await inter.response.send_message("🔘 Clicked Slash Primary Button!", ephemeral=True)
+
+        async def btn2_cb(inter: discord.Interaction):
+            await inter.response.send_message("🔘 Clicked Slash Success Button!", ephemeral=True)
+
+        btn1 = SimpleButton(
+            label="Slash Primary",
+            style=discord.ButtonStyle.primary,
+            custom_id="slash_btn_1",
+            callback=btn1_cb,
+        )
+        btn2 = SimpleButton(
+            label="Slash Success",
+            style=discord.ButtonStyle.success,
+            custom_id="slash_btn_2",
+            callback=btn2_cb,
+        )
+        view.add_item(btn1)
+        view.add_item(btn2)
+        await interaction.response.send_message(
+            "Here are interactive buttons dispatched from a slash command:", view=view
+        )
+
+    @message_context_menu(name="Quote Message")
+    async def ctx_quote_message(self, interaction: discord.Interaction, message: discord.Message):
+        """Message Context Menu: Quote selected message."""
+        content = message.content or "(Empty message or attachment only)"
+        author = message.author.display_name if hasattr(message, "author") else "Unknown"
+        await interaction.response.send_message(
+            f"💬 **Quoted from {author}**:\n> {content}",
+            ephemeral=True,
+        )
+
+    @user_context_menu(name="Inspect User")
+    async def ctx_inspect_user(self, interaction: discord.Interaction, user: discord.Member):
+        """User Context Menu: Inspect selected member."""
+        created = (
+            user.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            if hasattr(user, "created_at")
+            else "Unknown"
+        )
+        roles = [r.name for r in getattr(user, "roles", []) if r.name != "@everyone"]
+        roles_str = ", ".join(roles) if roles else "None"
+        discrim = (
+            f"#{user.discriminator}"
+            if getattr(user, "discriminator", None) and user.discriminator != "0"
+            else ""
+        )
+        await interaction.response.send_message(
+            f"👤 **User Info for {user.display_name}** (`{user.name}{discrim}`):\n"
+            f"• **ID**: `{user.id}`\n"
+            f"• **Bot**: `{user.bot}`\n"
+            f"• **Account Created**: {created}\n"
+            f"• **Roles**: {roles_str}",
+            ephemeral=True,
+        )

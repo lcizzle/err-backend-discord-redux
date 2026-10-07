@@ -5,7 +5,7 @@ import sys
 import time
 from collections import defaultdict, deque
 from threading import Lock
-from typing import Deque, Dict, Optional, Union
+from typing import Callable, Deque, Dict, List, Optional, Union
 
 from discordlib.person import DiscordPerson, DiscordSender
 from discordlib.room import DiscordCategory, DiscordRoom, DiscordRoomOccupant
@@ -34,6 +34,7 @@ log = logging.getLogger("errbot-backend-discord")
 
 try:
     import discord
+    from discord import app_commands
 except ImportError:
     log.exception("Could not start err-backend-discord")
     log.fatal("The required discord module could not be found.")
@@ -46,6 +47,7 @@ class DiscordBackend(ErrBot):
     """
 
     client = None
+    tree = None
 
     def __init__(self, config):
         super().__init__(config)
@@ -98,6 +100,10 @@ class DiscordBackend(ErrBot):
         # Interactive UI component and modal tracking
         self._active_component_items: Dict[str, discord.ui.Item] = {}
         self._active_modals: Dict[str, discord.ui.Modal] = {}
+        # Application command tracking
+        self.tree = None
+        self._plugin_slash_commands: Dict[str, list] = defaultdict(list)
+        self._bridged_commands: set = set()
 
     async def _retry_operation(self, operation, operation_name: str, *args, **kwargs):
         """
@@ -452,6 +458,9 @@ class DiscordBackend(ErrBot):
 
         for channel in DiscordBackend.client.get_all_channels():
             log.debug(f"Found channel: {channel}")
+
+        # Synchronize application commands (slash commands & context menus)
+        await self._sync_application_commands()
 
     async def on_message_edit(self, before, after):
         """
@@ -1126,6 +1135,29 @@ class DiscordBackend(ErrBot):
             if chunk_view is not None:
                 self._register_view_components(chunk_view)
             try:
+                # If message was triggered by a slash command interaction, send via interaction
+                interaction = None
+                if hasattr(msg, "extras") and isinstance(msg.extras, dict):
+                    interaction = msg.extras.get("interaction")
+
+                if isinstance(interaction, discord.Interaction) and getattr(
+                    interaction, "response", None
+                ):
+                    send_kwargs = {"content": message} if message else {}
+                    if chunk_view is not None:
+                        send_kwargs["view"] = chunk_view
+                    if not send_kwargs:
+                        send_kwargs["content"] = ""
+
+                    async def send_via_interaction():
+                        if interaction.response.is_done():
+                            return await interaction.followup.send(**send_kwargs)
+                        else:
+                            return await interaction.response.send_message(**send_kwargs)
+
+                    self._safe_run_coroutine(send_via_interaction(), "send_message_interaction")
+                    continue
+
                 # Check if message should be sent to a thread
                 if hasattr(msg, "extras") and msg.extras and msg.extras.get("thread_id"):
                     thread_id = msg.extras["thread_id"]
@@ -1516,6 +1548,430 @@ class DiscordBackend(ErrBot):
 
         return response
 
+    def add_slash_command(
+        self,
+        command_or_func: Union[app_commands.Command, Callable],
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        guild: Optional[Union[int, str, discord.abc.Snowflake]] = None,
+        guilds: Optional[List[Union[int, str, discord.abc.Snowflake]]] = None,
+        plugin_name: Optional[str] = None,
+    ) -> app_commands.Command:
+        """
+        Register a slash command with self.tree.
+        Can register an app_commands.Command or wrap a coroutine function.
+        Supports registering globally or targeting specific guild(s).
+        """
+        if not self.tree:
+            raise RuntimeError("CommandTree is not initialized.")
+
+        target_guilds = []
+        if guild is not None:
+            target_guilds.append(guild)
+        if guilds:
+            target_guilds.extend(guilds)
+
+        if isinstance(command_or_func, app_commands.Command):
+            cmd = command_or_func
+        else:
+            cmd_name = name or getattr(
+                command_or_func, "_slash_name", command_or_func.__name__.lower()
+            )
+            cmd_desc = description or getattr(
+                command_or_func,
+                "_slash_description",
+                (command_or_func.__doc__ or "Slash command").strip().split("\n")[0][:100],
+            )
+            cmd = app_commands.Command(
+                name=cmd_name,
+                description=cmd_desc,
+                callback=command_or_func,
+            )
+
+        if target_guilds:
+            for g in target_guilds:
+                guild_obj = (
+                    discord.Object(id=int(g)) if not isinstance(g, discord.abc.Snowflake) else g
+                )
+                existing = self.tree.get_command(cmd.name, guild=guild_obj)
+                if existing:
+                    self.tree.remove_command(cmd.name, guild=guild_obj)
+                self.tree.add_command(cmd, guild=guild_obj)
+        else:
+            existing = self.tree.get_command(cmd.name)
+            if existing:
+                self.tree.remove_command(cmd.name)
+            self.tree.add_command(cmd)
+
+        if plugin_name:
+            self._plugin_slash_commands[plugin_name].append(
+                (cmd.name, target_guilds, discord.AppCommandType.chat_input)
+            )
+
+        log.debug(f"Registered slash command '/{cmd.name}' (guilds: {target_guilds or 'global'})")
+        return cmd
+
+    def remove_slash_command(
+        self,
+        name: str,
+        guild: Optional[Union[int, str, discord.abc.Snowflake]] = None,
+    ) -> bool:
+        """
+        Remove a slash command from self.tree.
+        """
+        if not self.tree:
+            return False
+
+        guild_obj = None
+        if guild is not None:
+            guild_obj = (
+                discord.Object(id=int(guild))
+                if not isinstance(guild, discord.abc.Snowflake)
+                else guild
+            )
+
+        existing = self.tree.get_command(
+            name, guild=guild_obj, type=discord.AppCommandType.chat_input
+        )
+        if existing:
+            self.tree.remove_command(name, guild=guild_obj, type=discord.AppCommandType.chat_input)
+            log.debug(f"Removed slash command '/{name}'")
+            return True
+        return False
+
+    def remove_context_menu(
+        self,
+        name: str,
+        guild: Optional[Union[int, str, discord.abc.Snowflake]] = None,
+        menu_type: Optional[discord.AppCommandType] = None,
+    ) -> bool:
+        """
+        Remove a context menu command from self.tree.
+        """
+        if not self.tree:
+            return False
+
+        guild_obj = None
+        if guild is not None:
+            guild_obj = (
+                discord.Object(id=int(guild))
+                if not isinstance(guild, discord.abc.Snowflake)
+                else guild
+            )
+
+        cmd_type = menu_type or discord.AppCommandType.message
+        existing = self.tree.get_command(name, guild=guild_obj, type=cmd_type)
+        if existing:
+            self.tree.remove_command(name, guild=guild_obj, type=cmd_type)
+            log.debug(f"Removed context menu '{name}'")
+            return True
+        return False
+
+    def add_context_menu(
+        self,
+        menu_or_func: Union[app_commands.ContextMenu, Callable],
+        name: Optional[str] = None,
+        guild: Optional[Union[int, str, discord.abc.Snowflake]] = None,
+        guilds: Optional[List[Union[int, str, discord.abc.Snowflake]]] = None,
+        menu_type: Optional[discord.AppCommandType] = None,
+        plugin_name: Optional[str] = None,
+    ) -> app_commands.ContextMenu:
+        """
+        Register a user or message context menu command with self.tree.
+        """
+        if not self.tree:
+            raise RuntimeError("CommandTree is not initialized.")
+
+        target_guilds = []
+        if guild is not None:
+            target_guilds.append(guild)
+        if guilds:
+            target_guilds.extend(guilds)
+
+        if isinstance(menu_or_func, app_commands.ContextMenu):
+            menu = menu_or_func
+        else:
+            menu_name = name or getattr(menu_or_func, "_context_menu_name", menu_or_func.__name__)
+            menu = app_commands.ContextMenu(
+                name=menu_name,
+                callback=menu_or_func,
+                type=menu_type or discord.AppCommandType.message,
+            )
+
+        if target_guilds:
+            for g in target_guilds:
+                guild_obj = (
+                    discord.Object(id=int(g)) if not isinstance(g, discord.abc.Snowflake) else g
+                )
+                existing = self.tree.get_command(menu.name, guild=guild_obj, type=menu.type)
+                if existing:
+                    self.tree.remove_command(menu.name, guild=guild_obj, type=menu.type)
+                self.tree.add_command(menu, guild=guild_obj)
+        else:
+            existing = self.tree.get_command(menu.name, type=menu.type)
+            if existing:
+                self.tree.remove_command(menu.name, type=menu.type)
+            self.tree.add_command(menu)
+
+        if plugin_name:
+            self._plugin_slash_commands[plugin_name].append((menu.name, target_guilds, menu.type))
+
+        log.debug(f"Registered context menu '{menu.name}' (guilds: {target_guilds or 'global'})")
+        return menu
+
+    def register_plugin_commands(self, plugin) -> None:
+        """
+        Scan a plugin instance for @slash_command, @message_context_menu,
+        and @user_context_menu methods and register them to self.tree.
+        """
+        if not self.tree:
+            return
+
+        plugin_name = getattr(plugin, "name", str(plugin))
+
+        for attr_name in dir(plugin):
+            if attr_name.startswith("__"):
+                continue
+            try:
+                val = getattr(plugin, attr_name)
+            except Exception:
+                continue
+
+            if not callable(val):
+                continue
+
+            if getattr(val, "_is_slash_command", False):
+                cmd_name = getattr(val, "_slash_name", val.__name__.lower())
+                cmd_desc = getattr(val, "_slash_description", "Slash command")
+                cmd_guilds = getattr(val, "_slash_guilds", [])
+                self.add_slash_command(
+                    val,
+                    name=cmd_name,
+                    description=cmd_desc,
+                    guilds=cmd_guilds,
+                    plugin_name=plugin_name,
+                )
+
+            elif getattr(val, "_is_message_context_menu", False):
+                menu_name = getattr(val, "_context_menu_name", val.__name__)
+                menu_guilds = getattr(val, "_context_menu_guilds", [])
+                self.add_context_menu(
+                    val,
+                    name=menu_name,
+                    guilds=menu_guilds,
+                    menu_type=discord.AppCommandType.message,
+                    plugin_name=plugin_name,
+                )
+
+            elif getattr(val, "_is_user_context_menu", False):
+                menu_name = getattr(val, "_context_menu_name", val.__name__)
+                menu_guilds = getattr(val, "_context_menu_guilds", [])
+                self.add_context_menu(
+                    val,
+                    name=menu_name,
+                    guilds=menu_guilds,
+                    menu_type=discord.AppCommandType.user,
+                    plugin_name=plugin_name,
+                )
+
+    def unregister_plugin_commands(self, plugin) -> None:
+        """
+        Remove all slash commands and context menus registered by a plugin.
+        """
+        if not self.tree:
+            return
+
+        plugin_name = getattr(plugin, "name", str(plugin))
+        commands = self._plugin_slash_commands.pop(plugin_name, [])
+        for entry in commands:
+            if len(entry) == 3:
+                cmd_name, guilds, cmd_type = entry
+            else:
+                cmd_name, guilds = entry
+                cmd_type = discord.AppCommandType.chat_input
+
+            if guilds:
+                for g in guilds:
+                    guild_obj = (
+                        discord.Object(id=int(g)) if not isinstance(g, discord.abc.Snowflake) else g
+                    )
+                    self.tree.remove_command(cmd_name, guild=guild_obj, type=cmd_type)
+            else:
+                self.tree.remove_command(cmd_name, type=cmd_type)
+
+    def _register_all_plugin_commands(self) -> None:
+        """
+        Scan all active plugins for decorated application commands and register them.
+        """
+        if not hasattr(self, "plugin_manager") or not self.plugin_manager:
+            return
+
+        for plugin in self.plugin_manager.get_all_active_plugins():
+            self.register_plugin_commands(plugin)
+
+    def _bridge_errbot_commands(self) -> None:
+        """
+        Auto-bridge active Errbot botcmd commands into Discord slash commands.
+        Only commands with valid Discord-compatible names (lowercase alphanumeric, 1-32 chars)
+        are bridged.
+        """
+        if not self.tree:
+            return
+
+        import re
+
+        valid_name_regex = re.compile(r"^[a-z0-9_-]{1,32}$")
+
+        count = 0
+        for cmd_name, cmd_func in getattr(self, "all_commands", {}).items():
+            if count >= 90:  # Stay below Discord's 100 slash command limit
+                break
+
+            norm_name = cmd_name.strip().replace(" ", "_").lower()
+            if not valid_name_regex.match(norm_name):
+                continue
+
+            if self.tree.get_command(norm_name) is not None:
+                continue
+
+            doc = (
+                (cmd_func.__doc__ or f"Execute Errbot command !{cmd_name}")
+                .strip()
+                .split("\n")[0][:100]
+            )
+
+            def make_bridge_callback(target_cmd: str):
+                async def bridge_callback(
+                    interaction: discord.Interaction,
+                    args: Optional[str] = "",
+                ):
+                    if not interaction.response.is_done():
+                        await interaction.response.defer(ephemeral=False)
+
+                    user_id = str(interaction.user.id)
+                    channel_id = str(interaction.channel_id)
+                    if interaction.guild:
+                        sender = DiscordRoomOccupant(user_id, channel_id)
+                        room = DiscordRoom.from_id(channel_id)
+                    else:
+                        sender = DiscordPerson(user_id)
+                        room = sender
+
+                    body = f"!{target_cmd} {args or ''}".strip()
+                    err_msg = Message(body=body)
+                    err_msg.frm = sender
+                    err_msg.to = room
+                    err_msg.extras["discord_message_id"] = str(interaction.id)
+                    err_msg.extras["interaction"] = interaction
+
+                    loop = asyncio.get_running_loop()
+                    try:
+                        await loop.run_in_executor(None, self.callback_message, err_msg)
+                    except Exception as e:
+                        log.exception(f"Error executing bridged command !{target_cmd}: {e}")
+                        if not interaction.response.is_done():
+                            await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+                        else:
+                            await interaction.followup.send(f"Error: {e}", ephemeral=True)
+
+                return bridge_callback
+
+            bridge_cmd = app_commands.Command(
+                name=norm_name,
+                description=doc,
+                callback=make_bridge_callback(cmd_name),
+            )
+            self.tree.add_command(bridge_cmd)
+            self._bridged_commands.add(norm_name)
+            count += 1
+
+        if count > 0:
+            log.info(f"Auto-bridged {count} Errbot commands into Discord slash commands.")
+
+    async def _sync_application_commands(self) -> None:
+        """
+        Synchronize application commands (slash commands and context menus) with Discord.
+        """
+        if not self.tree:
+            return
+
+        sync_enabled = True
+        guild_sync_ids = []
+        auto_bridge = False
+
+        if hasattr(self, "bot_config"):
+            bot_identity = getattr(self.bot_config, "BOT_IDENTITY", {})
+            if isinstance(bot_identity, dict):
+                sync_enabled = bot_identity.get("sync_commands", True)
+                raw_guild_id = bot_identity.get("guild_sync_id")
+                if raw_guild_id:
+                    if isinstance(raw_guild_id, (list, tuple, set)):
+                        guild_sync_ids = [int(gid) for gid in raw_guild_id]
+                    else:
+                        guild_sync_ids = [int(raw_guild_id)]
+                auto_bridge = bot_identity.get("auto_bridge_commands", False)
+
+        self._register_all_plugin_commands()
+
+        if auto_bridge:
+            self._bridge_errbot_commands()
+
+        if not sync_enabled:
+            log.info("Slash command automatic sync is disabled by configuration.")
+            return
+
+        try:
+            if guild_sync_ids:
+                for gid in guild_sync_ids:
+                    guild_obj = discord.Object(id=gid)
+                    self.tree.copy_global_to(guild=guild_obj)
+                    synced = await self.tree.sync(guild=guild_obj)
+                    log.info(f"Synced {len(synced)} slash commands to guild {gid}.")
+            else:
+                synced = await self.tree.sync()
+                log.info(f"Synced {len(synced)} global slash commands with Discord.")
+        except Exception as e:
+            log.exception(f"Failed to synchronize slash commands: {e}")
+
+    def sync_slash_commands(
+        self, guild_id: Optional[Union[int, str]] = None
+    ) -> Optional[List[app_commands.AppCommand]]:
+        """
+        Synchronously or asynchronously sync application commands with Discord on demand.
+        If guild_id is provided, syncs to that guild immediately.
+        Otherwise syncs globally.
+        """
+        if not self.tree:
+            raise RuntimeError("CommandTree is not initialized.")
+
+        self._register_all_plugin_commands()
+
+        if hasattr(self, "bot_config"):
+            bot_identity = getattr(self.bot_config, "BOT_IDENTITY", {})
+            if isinstance(bot_identity, dict) and bot_identity.get("auto_bridge_commands", False):
+                self._bridge_errbot_commands()
+
+        async def _do_sync():
+            if guild_id is not None:
+                guild_obj = discord.Object(id=int(guild_id))
+                self.tree.copy_global_to(guild=guild_obj)
+                synced = await self.tree.sync(guild=guild_obj)
+                log.info(f"Manually synced {len(synced)} commands to guild {guild_id}.")
+                return synced
+            else:
+                synced = await self.tree.sync()
+                log.info(f"Manually synced {len(synced)} global slash commands.")
+                return synced
+
+        try:
+            loop = asyncio.get_running_loop()
+            if loop == DiscordBackend.client.loop:
+                return loop.create_task(_do_sync())
+        except RuntimeError:
+            pass
+
+        return self._safe_run_coroutine(_do_sync(), "sync_slash_commands", timeout=30.0)
+
     def config_intents(self):
         """
         Process discord intents configuration for bot.
@@ -1584,6 +2040,8 @@ class DiscordBackend(ErrBot):
 
         bot_intents = self.config_intents()
         DiscordBackend.client = discord.Client(intents=bot_intents)
+        DiscordBackend.tree = app_commands.CommandTree(DiscordBackend.client)
+        self.tree = DiscordBackend.tree
 
         # Register discord event coroutines.
         for func in [
