@@ -26,12 +26,27 @@ class DiscordRoom(Room, DiscordSender):
 
     @classmethod
     def from_id(cls, channel_id):
-        channel = DiscordRoom.client.get_channel(channel_id)
+        cid = int(channel_id)
+        channel = DiscordRoom.client.get_channel(cid)
+
+        if channel is None:
+            # Try to fetch channel from Discord API if not in client cache
+            try:
+                import asyncio
+
+                future = asyncio.run_coroutine_threadsafe(
+                    DiscordRoom.client.fetch_channel(cid),
+                    loop=DiscordRoom.client.loop,
+                )
+                channel = future.result(timeout=5.0)
+            except Exception as e:
+                log.debug(f"Could not fetch channel {channel_id}: {e}")
 
         if channel is None:
             raise ValueError(f"Channel id:{channel_id} doesn't exist!")
 
-        return cls(channel.name, channel.guild.id, channel.id)
+        guild_id = channel.guild.id if hasattr(channel, "guild") else None
+        return cls(channel.name, guild_id, channel.id)
 
     def __init__(self, channel_name: str = None, guild_id: str = None, channel_id: str = None):
         """

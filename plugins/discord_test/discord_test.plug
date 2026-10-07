@@ -1,0 +1,9 @@
+[Core]
+name = DiscordTest
+module = discord_test
+
+[Documentation]
+description = Admin test suite to verify Discord backend features and capabilities.
+
+[Python]
+version = 3

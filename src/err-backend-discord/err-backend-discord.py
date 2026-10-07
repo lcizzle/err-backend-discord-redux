@@ -434,14 +434,21 @@ class DiscordBackend(ErrBot):
         """
         Message event handler
         """
-        err_msg = Message(msg.content, extras=msg.embeds)
-
         # if the message coming in is from a webhook, it will not have a username
         # this will cause the whole process to fail.  In those cases, return without
         # processing.
-
         if msg.author.bot:
             return
+
+        extras = {
+            "discord_message_id": str(msg.id),
+            "channel_id": str(msg.channel.id),
+            "embeds": list(msg.embeds) if msg.embeds else [],
+        }
+        if isinstance(msg.channel, discord.Thread):
+            extras["thread_id"] = str(msg.channel.id)
+
+        err_msg = Message(msg.content, extras=extras)
 
         if isinstance(msg.channel, discord.abc.PrivateChannel):
             err_msg.frm = DiscordPerson(msg.author.id)
@@ -449,6 +456,11 @@ class DiscordBackend(ErrBot):
         else:
             err_msg.to = DiscordRoom.from_id(msg.channel.id)
             err_msg.frm = DiscordRoomOccupant(msg.author.id, msg.channel.id)
+
+        # Cache the message for lookup by ID or reactions
+        self._cache_message(str(msg.id), msg)
+        msg_cache_key = f"{err_msg.to}:{getattr(err_msg, 'body', '')[:50]}"
+        self._cache_message(msg_cache_key, msg)
 
         if self.process_message(err_msg):
             # Message contains a command
@@ -498,87 +510,122 @@ class DiscordBackend(ErrBot):
         else:
             log.debug("Unrecognised member update, ignoring...")
 
-    async def on_reaction_add(self, reaction, user):
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         """
-        Reaction add event handler
+        Raw reaction add event handler (handles cached and uncached messages).
         """
-        if user.bot:
-            return  # Ignore bot reactions
+        if DiscordBackend.client.user and payload.user_id == DiscordBackend.client.user.id:
+            return  # Ignore reactions from the bot itself
+
+        # Ignore reactions from bots if member is available and is a bot
+        if payload.member and payload.member.bot:
+            return
 
         try:
-            # Create the reactor (person who added the reaction)
-            if isinstance(reaction.message.channel, discord.abc.PrivateChannel):
-                reactor = DiscordPerson(user.id)
+            if payload.guild_id is None:
+                reactor = DiscordPerson(str(payload.user_id))
             else:
-                reactor = DiscordRoomOccupant(user.id, reaction.message.channel.id)
+                try:
+                    reactor = DiscordRoomOccupant(str(payload.user_id), str(payload.channel_id))
+                except Exception as ex:
+                    log.debug(
+                        f"Could not create DiscordRoomOccupant for channel {payload.channel_id}: {ex}. Falling back to DiscordPerson."
+                    )
+                    reactor = DiscordPerson(str(payload.user_id))
 
-            # Get reaction name (emoji or custom emoji name)
-            reaction_name = str(reaction.emoji)
-            if hasattr(reaction.emoji, "name"):
-                reaction_name = reaction.emoji.name
+            reaction_name = str(payload.emoji.name or payload.emoji)
 
-            # Create the reaction object
+            # Try to get cached message content/author if available in client cache
+            content = ""
+            author_id = ""
+            cached_msg = (
+                DiscordBackend.client.get_message(payload.message_id)
+                if hasattr(DiscordBackend.client, "get_message")
+                else None
+            )
+            if not cached_msg:
+                with self._message_cache_lock:
+                    cached_msg = self._message_cache.get(str(payload.message_id))
+
+            if cached_msg:
+                content = getattr(cached_msg, "content", "")[:100]
+                if getattr(cached_msg, "author", None):
+                    author_id = str(cached_msg.author.id)
+
             err_reaction = Reaction(
                 reactor=reactor,
                 action=REACTION_ADDED,
                 timestamp=str(int(time.time())),
                 reaction_name=reaction_name,
                 reacted_to={
-                    "message_id": str(reaction.message.id),
-                    "channel_id": str(reaction.message.channel.id),
-                    "author_id": str(reaction.message.author.id),
-                    "content": reaction.message.content[:100],  # First 100 chars for context
+                    "message_id": str(payload.message_id),
+                    "channel_id": str(payload.channel_id),
+                    "guild_id": str(payload.guild_id) if payload.guild_id else "",
+                    "author_id": author_id,
+                    "content": content,
                 },
             )
 
             log.debug(
-                f"Reaction added: {reaction_name} by {reactor} to message {reaction.message.id}"
+                f"Raw reaction added: {reaction_name} by {reactor} to message {payload.message_id}"
             )
             self.callback_reaction(err_reaction)
 
         except Exception as e:
-            log.error(f"Error processing reaction add event: {e}")
+            log.error(f"Error processing raw reaction add event: {e}")
 
-    async def on_reaction_remove(self, reaction, user):
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
         """
-        Reaction remove event handler
+        Raw reaction remove event handler (handles cached and uncached messages).
         """
-        if user.bot:
-            return  # Ignore bot reactions
+        if DiscordBackend.client.user and payload.user_id == DiscordBackend.client.user.id:
+            return  # Ignore reactions from the bot itself
 
         try:
-            # Create the reactor (person who removed the reaction)
-            if isinstance(reaction.message.channel, discord.abc.PrivateChannel):
-                reactor = DiscordPerson(user.id)
+            if payload.guild_id is None:
+                reactor = DiscordPerson(str(payload.user_id))
             else:
-                reactor = DiscordRoomOccupant(user.id, reaction.message.channel.id)
+                try:
+                    reactor = DiscordRoomOccupant(str(payload.user_id), str(payload.channel_id))
+                except Exception as ex:
+                    log.debug(
+                        f"Could not create DiscordRoomOccupant for channel {payload.channel_id}: {ex}. Falling back to DiscordPerson."
+                    )
+                    reactor = DiscordPerson(str(payload.user_id))
 
-            # Get reaction name (emoji or custom emoji name)
-            reaction_name = str(reaction.emoji)
-            if hasattr(reaction.emoji, "name"):
-                reaction_name = reaction.emoji.name
+            reaction_name = str(payload.emoji.name or payload.emoji)
 
-            # Create the reaction object
+            content = ""
+            author_id = ""
+            with self._message_cache_lock:
+                cached_msg = self._message_cache.get(str(payload.message_id))
+
+            if cached_msg:
+                content = getattr(cached_msg, "content", "")[:100]
+                if getattr(cached_msg, "author", None):
+                    author_id = str(cached_msg.author.id)
+
             err_reaction = Reaction(
                 reactor=reactor,
                 action=REACTION_REMOVED,
                 timestamp=str(int(time.time())),
                 reaction_name=reaction_name,
                 reacted_to={
-                    "message_id": str(reaction.message.id),
-                    "channel_id": str(reaction.message.channel.id),
-                    "author_id": str(reaction.message.author.id),
-                    "content": reaction.message.content[:100],  # First 100 chars for context
+                    "message_id": str(payload.message_id),
+                    "channel_id": str(payload.channel_id),
+                    "guild_id": str(payload.guild_id) if payload.guild_id else "",
+                    "author_id": author_id,
+                    "content": content,
                 },
             )
 
             log.debug(
-                f"Reaction removed: {reaction_name} by {reactor} from message {reaction.message.id}"
+                f"Raw reaction removed: {reaction_name} by {reactor} from message {payload.message_id}"
             )
             self.callback_reaction(err_reaction)
 
         except Exception as e:
-            log.error(f"Error processing reaction remove event: {e}")
+            log.error(f"Error processing raw reaction remove event: {e}")
 
     async def on_guild_channel_create(self, channel):
         """
@@ -741,6 +788,15 @@ class DiscordBackend(ErrBot):
                 if hasattr(msg, "extras") and msg.extras and msg.extras.get("thread_id"):
                     thread_id = msg.extras["thread_id"]
                     thread = DiscordBackend.client.get_channel(int(thread_id))
+                    if not thread:
+                        try:
+                            thread = self._safe_run_coroutine(
+                                DiscordBackend.client.fetch_channel(int(thread_id)),
+                                "fetch_thread_channel",
+                                timeout=5.0,
+                            )
+                        except Exception as e:
+                            log.debug(f"Failed to fetch thread {thread_id}: {e}")
                     if thread and isinstance(thread, discord.Thread):
                         self._safe_run_coroutine(
                             self._retry_operation(
@@ -911,8 +967,13 @@ class DiscordBackend(ErrBot):
 
                 if thread_id:
                     # Reply in existing thread
-                    response.extras = response.extras or {}
-                    response.extras["thread_id"] = thread_id
+                    if hasattr(response, "_extras") and isinstance(response._extras, dict):
+                        response._extras["thread_id"] = thread_id
+                    else:
+                        try:
+                            response.extras["thread_id"] = thread_id
+                        except Exception:
+                            setattr(response, "_extras", {"thread_id": thread_id})
                     log.debug(f"Replying in existing thread {thread_id}")
                 elif discord_msg_id and not mess.is_direct:
                     # Create a new thread from the original message
@@ -922,8 +983,13 @@ class DiscordBackend(ErrBot):
                         )
                         thread_id = self._create_thread_from_message(discord_msg_id, thread_name)
                         if thread_id:
-                            response.extras = response.extras or {}
-                            response.extras["thread_id"] = thread_id
+                            if hasattr(response, "_extras") and isinstance(response._extras, dict):
+                                response._extras["thread_id"] = thread_id
+                            else:
+                                try:
+                                    response.extras["thread_id"] = thread_id
+                                except Exception:
+                                    setattr(response, "_extras", {"thread_id": thread_id})
                             log.debug(f"Created new thread {thread_id} for threaded reply")
                     except Exception as e:
                         log.warning(f"Failed to create thread for reply: {e}")
@@ -1005,9 +1071,8 @@ class DiscordBackend(ErrBot):
             self.on_message,
             self.on_member_update,
             self.on_message_edit,
-            self.on_member_update,
-            self.on_reaction_add,
-            self.on_reaction_remove,
+            self.on_raw_reaction_add,
+            self.on_raw_reaction_remove,
             self.on_guild_channel_create,
             self.on_guild_channel_delete,
             self.on_guild_channel_update,
@@ -1153,6 +1218,71 @@ class DiscordBackend(ErrBot):
                 del self._message_cache[oldest_key]
 
             self._message_cache[errbot_msg_id] = discord_msg
+
+    def _fetch_message_by_id(self, discord_msg_id: str) -> Optional[discord.Message]:
+        """
+        Attempt to locate or fetch a Discord message by its ID.
+        """
+        # First check cache
+        with self._message_cache_lock:
+            cached_msg = self._message_cache.get(str(discord_msg_id))
+            if cached_msg:
+                return cached_msg
+
+        # If not cached, attempt to look up across channels if client is connected
+        if not DiscordBackend.client:
+            return None
+
+        async def fetch():
+            msg_id_int = int(discord_msg_id)
+            for guild in DiscordBackend.client.guilds:
+                for channel in guild.text_channels:
+                    try:
+                        return await channel.fetch_message(msg_id_int)
+                    except (discord.NotFound, discord.Forbidden):
+                        continue
+                    except Exception as e:
+                        log.debug(
+                            f"Error checking channel {channel.id} for message {discord_msg_id}: {e}"
+                        )
+                        continue
+            return None
+
+        try:
+            return self._safe_run_coroutine(fetch(), "_fetch_message_by_id", timeout=5.0)
+        except Exception as e:
+            log.debug(f"Failed to fetch message {discord_msg_id}: {e}")
+            return None
+
+    def _create_thread_from_message(self, discord_msg_id: str, thread_name: str) -> Optional[str]:
+        """
+        Create a new Discord thread from a message ID.
+
+        Args:
+            discord_msg_id: The Discord message ID to start the thread on
+            thread_name: The name for the new thread
+
+        Returns:
+            The string ID of the created thread, or None if creation failed
+        """
+        msg = self._fetch_message_by_id(discord_msg_id)
+        if not msg:
+            log.warning(f"Cannot create thread '{thread_name}': message {discord_msg_id} not found")
+            return None
+
+        async def create_thread():
+            thread = await msg.create_thread(name=thread_name)
+            return str(thread.id)
+
+        try:
+            thread_id = self._safe_run_coroutine(
+                create_thread(), "_create_thread_from_message", timeout=5.0
+            )
+            log.info(f"Created thread '{thread_name}' ({thread_id}) on message {discord_msg_id}")
+            return thread_id
+        except Exception as e:
+            log.error(f"Failed to create thread '{thread_name}' on message {discord_msg_id}: {e}")
+            return None
 
     def _get_discord_message_from_errbot_message(self, msg: Message):
         """
