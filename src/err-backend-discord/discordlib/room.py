@@ -58,9 +58,18 @@ class DiscordRoom(Room, DiscordSender):
         :param channel_id:
         """
         self.discord_channel = None
+        self._channel_name = channel_name
+        self._guild_id = int(guild_id) if guild_id else None
+
         if channel_id:
             self._channel_id = int(channel_id)
-            self.discord_channel = DiscordRoom.client.get_channel(self._channel_id)
+            if DiscordRoom.client:
+                self.discord_channel = DiscordRoom.client.get_channel(self._channel_id)
+            if self.discord_channel:
+                if not self._channel_name and hasattr(self.discord_channel, "name"):
+                    self._channel_name = self.discord_channel.name
+                if not self._guild_id and hasattr(self.discord_channel, "guild"):
+                    self._guild_id = self.discord_channel.guild.id
         elif guild_id and channel_name:
             guild = DiscordRoom.client.get_guild(int(guild_id))
             if guild:
@@ -93,11 +102,24 @@ class DiscordRoom(Room, DiscordSender):
             for channel in DiscordRoom.client.get_all_channels()
             if self._channel_name == channel.name
             and channel.guild.id == self._guild_id
-            and isinstance(channel, discord.TextChannel)
+            and (
+                isinstance(
+                    channel,
+                    (
+                        discord.TextChannel,
+                        discord.Thread,
+                        discord.VoiceChannel,
+                        discord.StageChannel,
+                    ),
+                )
+                or (hasattr(discord, "ForumChannel") and isinstance(channel, discord.ForumChannel))
+            )
         ]
 
         if len(matching) == 0:
-            raise ValueError(f"Failed to look up {channel} on server/guild {self._guild_id}!")
+            raise ValueError(
+                f"Failed to look up {self._channel_name} on server/guild {self._guild_id}!"
+            )
 
         if len(matching) > 1:
             log.warning(
@@ -227,10 +249,9 @@ class DiscordRoom(Room, DiscordSender):
 
     @property
     def exists(self) -> bool:
-        return None not in [
-            self._channel_id,
-            DiscordRoom.client.get_channel(self._channel_id),
-        ]
+        if self._channel_id is None or not DiscordRoom.client:
+            return False
+        return DiscordRoom.client.get_channel(self._channel_id) is not None
 
     @property
     def guild(self):
@@ -238,6 +259,10 @@ class DiscordRoom(Room, DiscordSender):
         Gets the guild_id this channel belongs to. None if it doesn't exist
         :return: Guild id or None
         """
+        if self._guild_id is None and self._channel_id is not None and DiscordRoom.client:
+            ch = DiscordRoom.client.get_channel(self._channel_id)
+            if ch and hasattr(ch, "guild"):
+                self._guild_id = ch.guild.id
         return self._guild_id
 
     @property
@@ -247,11 +272,11 @@ class DiscordRoom(Room, DiscordSender):
 
         :return: channels' name
         """
-        if self._channel_id is None:
-            return self._channel_name
-        else:
-            self._channel_name = DiscordRoom.client.get_channel(self._channel_id).name
-            return self._channel_name
+        if self._channel_id is not None and DiscordRoom.client:
+            ch = DiscordRoom.client.get_channel(self._channel_id)
+            if ch and hasattr(ch, "name"):
+                self._channel_name = ch.name
+        return self._channel_name or ""
 
     @property
     def id(self):
@@ -264,6 +289,19 @@ class DiscordRoom(Room, DiscordSender):
     async def send(self, content: str = None, embed: discord.Embed = None):
         if not self.exists:
             raise RuntimeError("Can't send a message on a non-existent channel")
+
+        # Handle Discord ForumChannel (requires creating a post/thread)
+        if hasattr(discord, "ForumChannel") and isinstance(
+            self.discord_channel, discord.ForumChannel
+        ):
+            thread_name = (content or "New Post").strip().split("\n")[0][:100]
+            await self.discord_channel.create_thread(
+                name=thread_name,
+                content=content or None,
+                embed=embed or None,
+            )
+            return
+
         if not isinstance(self.discord_channel, discord.abc.Messageable):
             raise RuntimeError(
                 f"Channel {self.name}[id:{self._channel_id}] doesn't support sending text messages"

@@ -86,6 +86,7 @@ class DiscordBackend(ErrBot):
         self._message_cache: Dict[str, discord.Message] = {}  # errbot message id -> discord message
         self._message_cache_lock = Lock()
         self._max_cached_messages = config.BOT_IDENTITY.get("max_cached_messages", 1000)
+        self._thread_cache: Dict[str, discord.Thread] = {}
 
     async def _retry_operation(self, operation, operation_name: str, *args, **kwargs):
         """
@@ -171,8 +172,8 @@ class DiscordBackend(ErrBot):
                 future.add_done_callback(handle_result)
                 return None  # Don't block
             else:
-                # For critical operations, wait with reduced timeout
-                return future.result(timeout=min(timeout, 5.0))
+                # For critical operations, wait with the specified timeout
+                return future.result(timeout=timeout)
 
         except asyncio.TimeoutError:
             log.error(f"{operation_name} timed out after {timeout}s")
@@ -415,7 +416,9 @@ class DiscordBackend(ErrBot):
             log.debug(f"Message edited by {err_msg.frm}: '{before.content}' -> '{after.content}'")
 
             # Process the edited message if it contains a command
-            if self.process_message(err_msg):
+            loop = asyncio.get_running_loop()
+            should_dispatch = await loop.run_in_executor(None, self.process_message, err_msg)
+            if should_dispatch:
                 recipient = err_msg.frm
                 if isinstance(recipient, DiscordSender):
                     try:
@@ -423,6 +426,9 @@ class DiscordBackend(ErrBot):
                             self._dispatch_to_plugins("callback_message", err_msg)
                     except discord.HTTPException as e:
                         log.warning(f"Failed to trigger typing indicator: {e}")
+                        self._dispatch_to_plugins("callback_message", err_msg)
+                    except Exception as e:
+                        log.debug(f"Typing indicator error: {e}")
                         self._dispatch_to_plugins("callback_message", err_msg)
 
             # Note: Plugins can detect edited messages by checking msg.extras for 'edited': True
@@ -462,7 +468,10 @@ class DiscordBackend(ErrBot):
         msg_cache_key = f"{err_msg.to}:{getattr(err_msg, 'body', '')[:50]}"
         self._cache_message(msg_cache_key, msg)
 
-        if self.process_message(err_msg):
+        loop = asyncio.get_running_loop()
+        should_dispatch = await loop.run_in_executor(None, self.process_message, err_msg)
+
+        if should_dispatch:
             # Message contains a command
             recipient = err_msg.frm
 
@@ -475,12 +484,32 @@ class DiscordBackend(ErrBot):
             except discord.HTTPException as e:
                 log.warning(f"Failed to trigger typing indicator: {e}")
                 self._dispatch_to_plugins("callback_message", err_msg)
+            except Exception as e:
+                log.debug(f"Typing indicator error: {e}")
+                self._dispatch_to_plugins("callback_message", err_msg)
 
         if msg.mentions:
             self.callback_mention(
                 err_msg,
                 [DiscordRoomOccupant(mention.id, msg.channel.id) for mention in msg.mentions],
             )
+
+    def _dispatch_to_plugins(self, method: str, *args, **kwargs) -> None:
+        """
+        Safely dispatch an event to all active plugins that implement it.
+        Prevents AttributeError when plugins do not define custom or backend-specific callbacks.
+        """
+        if not hasattr(self, "plugin_manager") or not self.plugin_manager:
+            return
+
+        for plugin in self.plugin_manager.get_all_active_plugins():
+            if hasattr(plugin, method):
+                plugin_name = getattr(plugin, "name", str(plugin))
+                log.debug("Triggering %s on %s.", method, plugin_name)
+                try:
+                    getattr(plugin, method)(*args, **kwargs)
+                except Exception:
+                    log.exception("%s on %s crashed.", method, plugin_name)
 
     def is_from_self(self, msg: Message) -> bool:
         """
@@ -627,15 +656,169 @@ class DiscordBackend(ErrBot):
         except Exception as e:
             log.error(f"Error processing raw reaction remove event: {e}")
 
+    async def on_message_delete(self, message: discord.Message):
+        """
+        Message delete event handler for cached messages.
+        """
+        try:
+            extras = {
+                "discord_message_id": str(message.id),
+                "channel_id": str(message.channel.id),
+                "deleted": True,
+                "cached": True,
+            }
+            if isinstance(message.channel, discord.Thread):
+                extras["thread_id"] = str(message.channel.id)
+
+            err_msg = Message(message.content, extras=extras)
+
+            if isinstance(message.channel, discord.abc.PrivateChannel):
+                err_msg.frm = DiscordPerson(str(message.author.id))
+                err_msg.to = self.bot_identifier
+            else:
+                try:
+                    err_msg.to = DiscordRoom.from_id(message.channel.id)
+                except Exception:
+                    err_msg.to = None
+                try:
+                    err_msg.frm = DiscordRoomOccupant(
+                        str(message.author.id), str(message.channel.id)
+                    )
+                except Exception:
+                    err_msg.frm = DiscordPerson(str(message.author.id))
+
+            log.debug(f"Message deleted: ID {message.id} in channel {message.channel.id}")
+            self._dispatch_to_plugins("callback_message_deleted", err_msg)
+
+            # Evict from internal cache
+            with self._message_cache_lock:
+                self._message_cache.pop(str(message.id), None)
+
+        except Exception as e:
+            log.error(f"Error processing message delete event: {e}")
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        """
+        Raw message delete event handler (handles cached and uncached messages).
+        """
+        try:
+            # Check if we had it cached internally before it was deleted
+            cached_msg = None
+            with self._message_cache_lock:
+                cached_msg = self._message_cache.pop(str(payload.message_id), None)
+
+            content = getattr(cached_msg, "content", "") if cached_msg else ""
+            author_id = (
+                str(cached_msg.author.id)
+                if cached_msg and getattr(cached_msg, "author", None)
+                else None
+            )
+
+            extras = {
+                "discord_message_id": str(payload.message_id),
+                "channel_id": str(payload.channel_id),
+                "guild_id": str(payload.guild_id) if payload.guild_id else "",
+                "deleted": True,
+                "cached": cached_msg is not None,
+            }
+            ch = (
+                DiscordBackend.client.get_channel(payload.channel_id)
+                if DiscordBackend.client
+                else None
+            )
+            if ch and isinstance(ch, discord.Thread):
+                extras["thread_id"] = str(ch.id)
+            elif getattr(payload, "thread_id", None):
+                extras["thread_id"] = str(payload.thread_id)
+
+            err_msg = Message(content, extras=extras)
+
+            if payload.guild_id is None:
+                err_msg.to = self.bot_identifier
+                err_msg.frm = DiscordPerson(author_id) if author_id else None
+            else:
+                try:
+                    err_msg.to = DiscordRoom.from_id(payload.channel_id)
+                except Exception:
+                    err_msg.to = None
+                if author_id:
+                    try:
+                        err_msg.frm = DiscordRoomOccupant(author_id, str(payload.channel_id))
+                    except Exception:
+                        err_msg.frm = DiscordPerson(author_id)
+                else:
+                    err_msg.frm = None
+
+            log.debug(
+                f"Raw message deleted: ID {payload.message_id} in channel {payload.channel_id}"
+            )
+            self._dispatch_to_plugins("callback_raw_message_deleted", err_msg)
+
+        except Exception as e:
+            log.error(f"Error processing raw message delete event: {e}")
+
+    async def on_thread_create(self, thread: discord.Thread):
+        """
+        Thread create event handler.
+        """
+        try:
+            room = DiscordRoom.from_id(thread.id)
+            log.info(
+                f"Thread created: {thread.name} (ID: {thread.id}) in parent {thread.parent_id} (Guild: {thread.guild.name})"
+            )
+            self._dispatch_to_plugins("callback_thread_created", room)
+            self.callback_room_joined(room)
+        except Exception as e:
+            log.error(f"Error processing thread create event: {e}")
+
+    async def on_thread_delete(self, thread: discord.Thread):
+        """
+        Thread delete event handler.
+        """
+        try:
+            self._thread_cache.pop(str(thread.id), None)
+            guild_id = thread.guild.id if hasattr(thread, "guild") and thread.guild else None
+            room = DiscordRoom(channel_name=thread.name, guild_id=guild_id, channel_id=thread.id)
+            log.info(
+                f"Thread deleted: {thread.name} (ID: {thread.id}) in parent {thread.parent_id} (Guild: {getattr(thread.guild, 'name', '')})"
+            )
+            self._dispatch_to_plugins("callback_thread_deleted", room)
+            self.callback_room_left(room)
+        except Exception as e:
+            log.error(f"Error processing thread delete event: {e}")
+
+    async def on_thread_update(self, before: discord.Thread, after: discord.Thread):
+        """
+        Thread update event handler.
+        """
+        try:
+            room = DiscordRoom.from_id(after.id)
+            if before.name != after.name:
+                log.info(f"Thread renamed: '{before.name}' -> '{after.name}' (ID: {after.id})")
+            if before.archived != after.archived:
+                log.info(
+                    f"Thread {after.name} archived state changed: {before.archived} -> {after.archived}"
+                )
+            if before.locked != after.locked:
+                log.info(
+                    f"Thread {after.name} locked state changed: {before.locked} -> {after.locked}"
+                )
+
+            self._dispatch_to_plugins("callback_thread_updated", room, before, after)
+        except Exception as e:
+            log.error(f"Error processing thread update event: {e}")
+
     async def on_guild_channel_create(self, channel):
         """
         Channel creation event handler
         """
         try:
-            if isinstance(channel, discord.TextChannel):
+            if isinstance(
+                channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)
+            ) or (hasattr(discord, "ForumChannel") and isinstance(channel, discord.ForumChannel)):
                 room = DiscordRoom.from_id(channel.id)
                 log.info(
-                    f"Text channel created: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}"
+                    f"{type(channel).__name__} created: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}"
                 )
                 self.callback_room_joined(room)
             elif isinstance(channel, discord.CategoryChannel):
@@ -654,10 +837,15 @@ class DiscordBackend(ErrBot):
         Channel deletion event handler
         """
         try:
-            if isinstance(channel, discord.TextChannel):
-                room = DiscordRoom.from_id(channel.id)
+            if isinstance(
+                channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel)
+            ) or (hasattr(discord, "ForumChannel") and isinstance(channel, discord.ForumChannel)):
+                guild_id = channel.guild.id if hasattr(channel, "guild") and channel.guild else None
+                room = DiscordRoom(
+                    channel_name=channel.name, guild_id=guild_id, channel_id=channel.id
+                )
                 log.info(
-                    f"Text channel deleted: {channel.name} (ID: {channel.id}) in guild {channel.guild.name}"
+                    f"{type(channel).__name__} deleted: {channel.name} (ID: {channel.id}) in guild {getattr(channel.guild, 'name', '')}"
                 )
                 self.callback_room_left(room)
             elif isinstance(channel, discord.CategoryChannel):
@@ -677,7 +865,9 @@ class DiscordBackend(ErrBot):
         try:
             # Check for topic changes
             if hasattr(before, "topic") and hasattr(after, "topic") and before.topic != after.topic:
-                if isinstance(after, discord.TextChannel):
+                if isinstance(after, (discord.TextChannel, discord.StageChannel)) or (
+                    hasattr(discord, "ForumChannel") and isinstance(after, discord.ForumChannel)
+                ):
                     room = DiscordRoom.from_id(after.id)
                     log.info(
                         f"Channel topic changed in {after.name}: '{before.topic}' -> '{after.topic}'"
@@ -787,13 +977,15 @@ class DiscordBackend(ErrBot):
                 # Check if message should be sent to a thread
                 if hasattr(msg, "extras") and msg.extras and msg.extras.get("thread_id"):
                     thread_id = msg.extras["thread_id"]
-                    thread = DiscordBackend.client.get_channel(int(thread_id))
+                    thread = self._thread_cache.get(
+                        str(thread_id)
+                    ) or DiscordBackend.client.get_channel(int(thread_id))
                     if not thread:
                         try:
                             thread = self._safe_run_coroutine(
                                 DiscordBackend.client.fetch_channel(int(thread_id)),
                                 "fetch_thread_channel",
-                                timeout=5.0,
+                                timeout=10.0,
                             )
                         except Exception as e:
                             log.debug(f"Failed to fetch thread {thread_id}: {e}")
@@ -981,7 +1173,10 @@ class DiscordBackend(ErrBot):
                         thread_name = (
                             f"Reply to {mess.frm.nick}" if hasattr(mess.frm, "nick") else "Thread"
                         )
-                        thread_id = self._create_thread_from_message(discord_msg_id, thread_name)
+                        channel_id = mess.extras.get("channel_id")
+                        thread_id = self._create_thread_from_message(
+                            discord_msg_id, thread_name, channel_id=channel_id
+                        )
                         if thread_id:
                             if hasattr(response, "_extras") and isinstance(response._extras, dict):
                                 response._extras["thread_id"] = thread_id
@@ -1071,11 +1266,16 @@ class DiscordBackend(ErrBot):
             self.on_message,
             self.on_member_update,
             self.on_message_edit,
+            self.on_message_delete,
+            self.on_raw_message_delete,
             self.on_raw_reaction_add,
             self.on_raw_reaction_remove,
             self.on_guild_channel_create,
             self.on_guild_channel_delete,
             self.on_guild_channel_update,
+            self.on_thread_create,
+            self.on_thread_delete,
+            self.on_thread_update,
         ]:
             DiscordBackend.client.event(func)
 
@@ -1219,7 +1419,9 @@ class DiscordBackend(ErrBot):
 
             self._message_cache[errbot_msg_id] = discord_msg
 
-    def _fetch_message_by_id(self, discord_msg_id: str) -> Optional[discord.Message]:
+    def _fetch_message_by_id(
+        self, discord_msg_id: str, channel_id: Optional[str] = None
+    ) -> Optional[discord.Message]:
         """
         Attempt to locate or fetch a Discord message by its ID.
         """
@@ -1235,6 +1437,16 @@ class DiscordBackend(ErrBot):
 
         async def fetch():
             msg_id_int = int(discord_msg_id)
+            if channel_id:
+                try:
+                    ch = DiscordBackend.client.get_channel(int(channel_id))
+                    if not ch and hasattr(DiscordBackend.client, "fetch_channel"):
+                        ch = await DiscordBackend.client.fetch_channel(int(channel_id))
+                    if ch and hasattr(ch, "fetch_message"):
+                        return await ch.fetch_message(msg_id_int)
+                except Exception as e:
+                    log.debug(f"Direct channel fetch failed for {channel_id}: {e}")
+
             for guild in DiscordBackend.client.guilds:
                 for channel in guild.text_channels:
                     try:
@@ -1249,34 +1461,54 @@ class DiscordBackend(ErrBot):
             return None
 
         try:
-            return self._safe_run_coroutine(fetch(), "_fetch_message_by_id", timeout=5.0)
+            return self._safe_run_coroutine(fetch(), "_fetch_message_by_id", timeout=10.0)
         except Exception as e:
             log.debug(f"Failed to fetch message {discord_msg_id}: {e}")
             return None
 
-    def _create_thread_from_message(self, discord_msg_id: str, thread_name: str) -> Optional[str]:
+    def _create_thread_from_message(
+        self, discord_msg_id: str, thread_name: str, channel_id: Optional[str] = None
+    ) -> Optional[str]:
         """
         Create a new Discord thread from a message ID.
 
         Args:
             discord_msg_id: The Discord message ID to start the thread on
             thread_name: The name for the new thread
+            channel_id: Optional Discord channel ID where the message is located
 
         Returns:
             The string ID of the created thread, or None if creation failed
         """
-        msg = self._fetch_message_by_id(discord_msg_id)
+        msg = self._fetch_message_by_id(discord_msg_id, channel_id=channel_id)
         if not msg:
             log.warning(f"Cannot create thread '{thread_name}': message {discord_msg_id} not found")
             return None
 
         async def create_thread():
-            thread = await msg.create_thread(name=thread_name)
-            return str(thread.id)
+            existing_thread = getattr(msg, "thread", None)
+            if existing_thread and isinstance(existing_thread, discord.Thread):
+                self._thread_cache[str(existing_thread.id)] = existing_thread
+                return str(existing_thread.id)
+            try:
+                thread = await msg.create_thread(name=thread_name)
+                self._thread_cache[str(thread.id)] = thread
+                return str(thread.id)
+            except discord.HTTPException as e:
+                if getattr(e, "code", None) == 160004:
+                    log.info(f"Thread already exists on message {discord_msg_id}, reusing thread")
+                    thread_id_str = str(discord_msg_id)
+                    th = getattr(msg, "thread", None) or DiscordBackend.client.get_channel(
+                        int(thread_id_str)
+                    )
+                    if th:
+                        self._thread_cache[thread_id_str] = th
+                    return thread_id_str
+                raise
 
         try:
             thread_id = self._safe_run_coroutine(
-                create_thread(), "_create_thread_from_message", timeout=5.0
+                create_thread(), "_create_thread_from_message", timeout=15.0
             )
             log.info(f"Created thread '{thread_name}' ({thread_id}) on message {discord_msg_id}")
             return thread_id
